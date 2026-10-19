@@ -4,7 +4,7 @@
 const https = require("https");
 const { createStore, runHook } = require("./harness");
 
-const [mediaUrl, range = "bytes=0-4194303", argument = "threads=4&per_node=1&chunk_kb=1024"] = process.argv.slice(2);
+const [mediaUrl, range = "bytes=0-4194303", argument = "threads=8&per_node=1&chunk_kb=1024"] = process.argv.slice(2);
 if (!mediaUrl) {
   console.error("usage: node dev/live.js <media url> [range] [argument]");
   process.exit(1);

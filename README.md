@@ -30,14 +30,14 @@
 | --- | --- | --- |
 | `Mode` | `fanout` | `fanout` 或 `swap` |
 | `Nodes` | `mainland` | `mainland`、`overseas`、`all`，或用 `\|` 分隔的 host（只接受 `upos-*.bilivideo.com`、`upos-*.akamaized.net`、`cn-*.bilivideo.com`） |
-| `Threads` | `4` | 一个 Range 同时发几个块请求 |
+| `Threads` | `8` | 一个 Range 同时发几个块请求 |
 | `PerNode` | `1` | 同一节点同时几个请求 |
 | `ChunkKB` | `1024` | 每块大小 |
 | `OpenRange` | `swap` | `swap` 或 `clip` |
 | `MaxMB` | `16` | 超过这个大小的 Range 只 swap |
 | `PCDN` | `REJECT` | 改成 `DIRECT` 就放行 PCDN |
 
-线程默认值偏保守：B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟。想加速再慢慢调大 `Threads`/`PerNode`。
+默认 8 线程配 `PerNode=1`，正好分到大陆预设的 8–9 个节点上，每个节点只开一个请求。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `refused by several nodes`，就把 `Threads` 调回 4。
 
 ## 怎么确认在工作
 
