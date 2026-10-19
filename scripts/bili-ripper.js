@@ -18,7 +18,8 @@ const MAX_ATTEMPTS = 3;
 const CHUNK_TIMEOUT_S = 15;
 // A chunk still running this many times longer than the finished ones is fetched again from
 // another node; whichever copy arrives first is used. Before anything has finished, the fixed
-// delay applies. At most this many extra copies run at once.
+// delay applies. At most this many extra copies run at once. The lagging node is not blamed,
+// its speed estimate just drops to what it has shown so far, so it sinks in the ranking.
 const HEDGE_FACTOR = 2;
 const HEDGE_MIN_MS = 1500;
 const HEDGE_FIRST_MS = 5000;
@@ -219,7 +220,7 @@ function swappedHeaders(headers, host) {
 function planChunks(start, end, chunkBytes) {
   const chunks = [];
   for (let at = start; at <= end; at += chunkBytes) {
-    chunks.push({ start: at, end: Math.min(end, at + chunkBytes - 1), attempts: 0, tried: [] });
+    chunks.push({ start: at, end: Math.min(end, at + chunkBytes - 1), attempts: 0, tried: [], began: {} });
   }
   return chunks;
 }
@@ -272,12 +273,32 @@ function fetchChunk(job, host, chunk) {
   });
 }
 
+// Fastest expected stream first: a fast node's second slot beats a slow node's first.
+// Never-measured nodes still go first so each one gets measured.
 function pickChunkNode(job, chunk, freeOnly) {
   const ranked = rankedNodes(job.config, job.state, Date.now(), chunk.tried);
-  const free = ranked.filter((host) => (job.inflight[host] || 0) < job.config.perNode);
-  if (free.length) return free[0];
-  if (freeOnly) return null;
-  return ranked.slice().sort((a, b) => (job.inflight[a] || 0) - (job.inflight[b] || 0))[0];
+  const load = (host) => job.inflight[host] || 0;
+  const free = ranked.filter((host) => load(host) < job.config.perNode);
+  if (!free.length) {
+    if (freeOnly) return null;
+    return ranked.slice().sort((a, b) => load(a) - load(b))[0];
+  }
+  const perStream = (host) => {
+    const bps = job.state.nodes[host] && job.state.nodes[host].bps;
+    return bps ? bps / (load(host) + 1) : Infinity;
+  };
+  return free.slice().sort((a, b) => (perStream(a) === perStream(b) ? 0 : perStream(b) > perStream(a) ? 1 : -1))[0];
+}
+
+// Caps a node's speed estimate at what a still-running chunk has achieved so far.
+function slowDown(job, host, chunk) {
+  const node = nodeOf(job.state, host);
+  const elapsed = Math.max(Date.now() - chunk.began[host], 1);
+  const shown = Math.round((chunk.end - chunk.start + 1) * 1000 / elapsed);
+  if (!node.bps || shown < node.bps) {
+    node.bps = shown;
+    node.at = Date.now();
+  }
 }
 
 function hedgeDelay(job) {
@@ -299,6 +320,7 @@ function fetchChunkRaced(job, chunk) {
       job.inflight[host] = (job.inflight[host] || 0) + 1;
       if (hedge) job.hedges += 1;
       const began = Date.now();
+      chunk.began[host] = began;
       fetchChunk(job, host, chunk).then((result) => {
         job.inflight[host] -= 1;
         if (hedge) job.hedges -= 1;
@@ -336,8 +358,7 @@ function fetchChunkRaced(job, chunk) {
       if (settled || job.aborted || job.hedges >= HEDGE_MAX_INFLIGHT) return;
       const host = pickChunkNode(job, chunk, true);
       if (!host) return;
-      // The lagging node is charged a failure now; a late success clears it again.
-      recordNode(job.state, slowHost, false, 0, Date.now());
+      slowDown(job, slowHost, chunk);
       job.hedged += 1;
       launch(host, true);
     };

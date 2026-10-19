@@ -119,7 +119,7 @@ test("fanout retries a chunk elsewhere when a node sends the wrong bytes", async
   assert.ok(cdn.calls.length > 4);
 });
 
-test("a chunk stuck on one node is fetched again elsewhere and the node is charged", async () => {
+test("a chunk stuck on one node is fetched again elsewhere and the node sinks in the ranking", async () => {
   const stuck = MAINLAND[0];
   const cdn = createCdn(4 * MB, (host) => (host === stuck ? "hang" : "ok"));
   const store = createStore();
@@ -137,7 +137,27 @@ test("a chunk stuck on one node is fetched again elsewhere and the node is charg
   const copies = cdn.calls.filter((call) => call.start === stuckCalls[0].start);
   assert.equal(copies.length, 2);
   assert.notEqual(copies[1].host, stuck);
-  assert.equal(state(store).nodes[stuck].fail, 1);
+  // Lagging is not a failure, but the node's speed estimate drops to what it has shown.
+  const nodes = state(store).nodes;
+  assert.equal(nodes[stuck].fail, 0);
+  assert.equal(nodes[stuck].until, 0);
+  assert.ok(nodes[stuck].bps > 0);
+  assert.ok(Object.keys(nodes).filter((host) => host !== stuck).every((host) => nodes[host].bps > nodes[stuck].bps));
+});
+
+test("a fast node's second slot is preferred over a slow node's first", async () => {
+  const store = createStore();
+  const fast = MAINLAND.slice(0, 2);
+  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {} };
+  MAINLAND.forEach((host) => { seed.nodes[host] = { bps: fast.includes(host) ? 4e6 : 2e5, at: Date.now(), fail: 0, until: 0 }; });
+  store.write(JSON.stringify(seed), "bili-ripper.state");
+  const cdn = createCdn(4 * MB);
+  const result = await runHook({
+    request: mediaRequest("bytes=0-2097151"), argument: "threads=4&per_node=2&chunk_kb=512", store, http: cdn.get
+  });
+  assert.equal(result.response.status, 206);
+  assert.ok(cdn.calls.every((call) => fast.includes(call.host)), "chunks went to " + cdn.calls.map((c) => c.host).join());
+  assert.ok(Object.values(cdn.maxInflight).every((count) => count <= 2));
 });
 
 test("one refusing node is worked around, two trigger cooldown and fall back to swap", async () => {
