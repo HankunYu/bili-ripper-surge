@@ -47,7 +47,7 @@ function runHook({ request, response, argument = "", store, http }) {
 }
 
 // A fake CDN serving one file. behaviour(host, range) may return "ok", a status number,
-// "error", "shift" (wrong part of the file) or "short" (truncated body).
+// "error", "shift" (wrong part of the file), "short" (truncated body) or "hang" (no reply).
 function createCdn(size, behaviour = () => "ok", replyHeaders = {}) {
   const file = new Uint8Array(size);
   for (let i = 0; i < size; i++) file[i] = (i * 31 + 7) & 0xff;
@@ -63,6 +63,7 @@ function createCdn(size, behaviour = () => "ok", replyHeaders = {}) {
     setImmediate(() => {
       cdn.inflight[host] -= 1;
       const verdict = behaviour(host, start, end);
+      if (verdict === "hang") return;
       if (verdict === "error") return callback("connection reset", null, null);
       if (typeof verdict === "number") return callback(null, { status: verdict, headers: {} }, new Uint8Array(0));
       if (start >= size) return callback(null, { status: 416, headers: {} }, new Uint8Array(0));

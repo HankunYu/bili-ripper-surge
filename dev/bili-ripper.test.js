@@ -103,7 +103,9 @@ test("fanout assembles a bounded Range from several nodes", async () => {
   assert.equal(sent["User-Agent"], "Mozilla/5.0 Chrome/130");
   assert.equal(sent.Origin, "https://www.bilibili.com");
   assert.equal(sent["Accept-Encoding"], "identity");
-  assert.equal(sent.Host, cdn.calls[0].host);
+  // HTTP/2 has no Host field; the URL names the node.
+  assert.equal(sent.Host, undefined);
+  assert.equal(reply.headers["X-Bili-Ripper"], "fanout chunks=6 nodes=" + hosts.size + " hedged=0");
   assert.ok(Object.values(state(store).nodes).some((node) => node.bps > 0));
 });
 
@@ -115,6 +117,27 @@ test("fanout retries a chunk elsewhere when a node sends the wrong bytes", async
   assert.equal(result.response.status, 206);
   assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 2097152)));
   assert.ok(cdn.calls.length > 4);
+});
+
+test("a chunk stuck on one node is fetched again elsewhere and the node is charged", async () => {
+  const stuck = MAINLAND[0];
+  const cdn = createCdn(4 * MB, (host) => (host === stuck ? "hang" : "ok"));
+  const store = createStore();
+  const began = Date.now();
+  const result = await runHook({
+    request: mediaRequest("bytes=0-2097151"), argument: "threads=4&per_node=1&chunk_kb=512", store, http: cdn.get
+  });
+  assert.equal(result.response.status, 206);
+  assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 2097152)));
+  assert.match(result.response.headers["X-Bili-Ripper"], /hedged=1$/);
+  // The hedge waited on the finished chunks, not on the 15 s chunk timeout.
+  assert.ok(Date.now() - began < 5000);
+  const stuckCalls = cdn.calls.filter((call) => call.host === stuck);
+  assert.equal(stuckCalls.length, 1);
+  const copies = cdn.calls.filter((call) => call.start === stuckCalls[0].start);
+  assert.equal(copies.length, 2);
+  assert.notEqual(copies[1].host, stuck);
+  assert.equal(state(store).nodes[stuck].fail, 1);
 });
 
 test("one refusing node is worked around, two trigger cooldown and fall back to swap", async () => {

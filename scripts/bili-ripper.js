@@ -16,6 +16,13 @@ const STALE_ASSIGN_MS = 30 * 1000;
 const MAX_ASSIGNS = 64;
 const MAX_ATTEMPTS = 3;
 const CHUNK_TIMEOUT_S = 15;
+// A chunk still running this many times longer than the finished ones is fetched again from
+// another node; whichever copy arrives first is used. Before anything has finished, the fixed
+// delay applies. At most this many extra copies run at once.
+const HEDGE_FACTOR = 2;
+const HEDGE_MIN_MS = 1500;
+const HEDGE_FIRST_MS = 5000;
+const HEDGE_MAX_INFLIGHT = 2;
 const FANOUT_BUDGET_MS = 25 * 1000;
 // Swap mode spreads files over this many of the best nodes.
 const SWAP_SPREAD = 3;
@@ -233,7 +240,7 @@ function forwardHeaders(headers) {
 }
 
 function fetchChunk(job, host, chunk) {
-  const headers = Object.assign({}, job.forward, { Host: host, Range: "bytes=" + chunk.start + "-" + chunk.end });
+  const headers = Object.assign({}, job.forward, { Range: "bytes=" + chunk.start + "-" + chunk.end });
   const began = Date.now();
   return new Promise((resolve) => {
     $httpClient.get({
@@ -265,11 +272,77 @@ function fetchChunk(job, host, chunk) {
   });
 }
 
-function pickChunkNode(job, chunk) {
+function pickChunkNode(job, chunk, freeOnly) {
   const ranked = rankedNodes(job.config, job.state, Date.now(), chunk.tried);
   const free = ranked.filter((host) => (job.inflight[host] || 0) < job.config.perNode);
   if (free.length) return free[0];
+  if (freeOnly) return null;
   return ranked.slice().sort((a, b) => (job.inflight[a] || 0) - (job.inflight[b] || 0))[0];
+}
+
+function hedgeDelay(job) {
+  if (!job.durations.length) return HEDGE_FIRST_MS;
+  const average = job.durations.reduce((sum, ms) => sum + ms, 0) / job.durations.length;
+  return Math.max(HEDGE_MIN_MS, Math.round(average * HEDGE_FACTOR));
+}
+
+// Fetches one chunk, starting a second copy elsewhere if the first one lags behind the others.
+// Resolves with the first good reply, or with the last failure once every copy has failed.
+// A copy that is still running when another one wins is left to finish on its own.
+function fetchChunkRaced(job, chunk) {
+  return new Promise((resolve) => {
+    let pending = 0;
+    let settled = false;
+    const launch = (host, hedge) => {
+      pending += 1;
+      chunk.tried.push(host);
+      job.inflight[host] = (job.inflight[host] || 0) + 1;
+      if (hedge) job.hedges += 1;
+      const began = Date.now();
+      fetchChunk(job, host, chunk).then((result) => {
+        job.inflight[host] -= 1;
+        if (hedge) job.hedges -= 1;
+        pending -= 1;
+        const now = Date.now();
+        result.host = host;
+        if (result.ok) {
+          recordNode(job.state, host, true, result.bps, now);
+        } else if (result.status !== 416) {
+          // A Range past the end of the file is the request's fault, not the node's.
+          recordNode(job.state, host, false, 0, now);
+          if (result.status === 403) job.refusedBy[host] = true;
+        }
+        if (settled) return;
+        if (result.ok) {
+          settled = true;
+          job.durations.push(now - began);
+          resolve(result);
+        } else if (pending === 0) {
+          settled = true;
+          resolve(result);
+        }
+      });
+      // The delay depends on chunks that finish later, so it is re-read until it is due.
+      const check = () => {
+        if (settled) return;
+        const due = began + hedgeDelay(job);
+        const now = Date.now();
+        if (now >= due) maybeHedge(host);
+        else setTimeout(check, Math.min(due - now, HEDGE_MIN_MS));
+      };
+      if (!hedge) setTimeout(check, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
+    };
+    const maybeHedge = (slowHost) => {
+      if (settled || job.aborted || job.hedges >= HEDGE_MAX_INFLIGHT) return;
+      const host = pickChunkNode(job, chunk, true);
+      if (!host) return;
+      // The lagging node is charged a failure now; a late success clears it again.
+      recordNode(job.state, slowHost, false, 0, Date.now());
+      job.hedged += 1;
+      launch(host, true);
+    };
+    launch(pickChunkNode(job, chunk, false), false);
+  });
 }
 
 function abortJob(job, reason) {
@@ -281,33 +354,25 @@ async function worker(job, queue) {
   while (queue.length) {
     if (job.aborted) throw job.aborted;
     const chunk = queue.shift();
-    const host = pickChunkNode(job, chunk);
-    job.inflight[host] = (job.inflight[host] || 0) + 1;
-    const result = await fetchChunk(job, host, chunk);
-    job.inflight[host] -= 1;
+    const result = await fetchChunkRaced(job, chunk);
     const now = Date.now();
     if (job.aborted) throw job.aborted;
     if (result.ok) {
-      recordNode(job.state, host, true, result.bps, now);
       chunk.body = result.body;
       chunk.end = result.end;
       job.total = result.total;
       if (!job.replyHeaders) job.replyHeaders = result.headers;
-      job.hosts[host] = true;
+      job.hosts[result.host] = true;
       job.done.push(chunk);
       continue;
     }
-    // A Range past the end of the file is the request's fault, not the node's.
     if (result.status === 416) abortJob(job, "range not satisfiable");
-    recordNode(job.state, host, false, 0, now);
-    if (result.status === 403) job.refusedBy[host] = true;
     // Refusals from several nodes mean Bilibili is throttling this address: back off entirely.
     if (Object.keys(job.refusedBy).length >= 2) {
       job.state.cooldown = now + COOLDOWN_MS;
       abortJob(job, "refused by several nodes");
     }
-    chunk.attempts += 1;
-    chunk.tried.push(host);
+    chunk.attempts = chunk.tried.length;
     if (chunk.attempts >= MAX_ATTEMPTS) abortJob(job, "chunk failed " + chunk.attempts + " times");
     if (now - job.startedAt > FANOUT_BUDGET_MS) abortJob(job, "out of time");
     queue.unshift(chunk);
@@ -328,6 +393,7 @@ async function fanout(request, url, config, state, range) {
     forward: forwardHeaders(request.headers),
     config, state,
     inflight: {}, refusedBy: {}, hosts: {}, done: [],
+    durations: [], hedges: 0, hedged: 0,
     total: 0, replyHeaders: null,
     startedAt: Date.now(), aborted: null
   };
@@ -358,7 +424,8 @@ async function fanout(request, url, config, state, range) {
   }
   headers["Content-Range"] = "bytes " + range.start + "-" + end + "/" + job.total;
   headers["Content-Length"] = String(body.length);
-  headers["X-Bili-Ripper"] = "fanout chunks=" + job.done.length + " nodes=" + Object.keys(job.hosts).length;
+  headers["X-Bili-Ripper"] = "fanout chunks=" + job.done.length + " nodes=" + Object.keys(job.hosts).length
+    + " hedged=" + job.hedged;
   return { status: 206, headers, body };
 }
 

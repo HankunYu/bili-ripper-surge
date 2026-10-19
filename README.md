@@ -12,6 +12,7 @@
 | `fanout`（默认） | 有界 Range（`bytes=a-b`）拆成 `ChunkKB` 大小的块，最多 `Threads` 个请求同时打到不同节点，校验 `Content-Range` 和长度后拼成一个 206 | 要等整段下完才返回，首字节晚一些 |
 
 - 同一个文件固定落在少数几个节点上（按 path hash），未测速的节点优先被试，测过的按速度排序，测速 10 分钟后过期重测。
+- 一块比已经完成的块慢两倍以上（至少 1.5 秒；一块都没完成时等 5 秒）就再向另一个节点要一份，谁先回用谁，同时最多补发两份。被追赶的节点先记一次失败，它之后回来了再抵消，所以挂住的连接不用等满 15 秒超时。
 - 节点连续失败两次封 5 分钟；`Bili Ripper Health` 脚本看响应状态，没有响应就重发的请求也算一次失败。
 - 两个以上节点同时 403 说明 B 站在限流这个 IP，fanout 停 2 分钟，期间只做 swap。
 - fanout 任何一步失败都回退到 swap，不会让请求直接失败。
@@ -41,7 +42,7 @@
 
 ## 怎么确认在工作
 
-- 浏览器开发者工具 → Network，看 `.m4s` 请求的响应头：fanout 返回的带 `X-Bili-Ripper: fanout chunks=N nodes=M`；被 swap 的请求会出现在 Surge 请求记录里，连向新的 host。
+- 浏览器开发者工具 → Network，看 `.m4s` 请求的响应头：fanout 返回的带 `X-Bili-Ripper: fanout chunks=N nodes=M hedged=K`，`K` 是补发过的块数；被 swap 的请求会出现在 Surge 请求记录里，连向新的 host。
 - Surge 脚本日志里的 `[bili-ripper] fanout fell back to swap: …` 是回退原因。
 - 节点测速和封禁状态存在 `$persistentStore` 的 `bili-ripper.state` 里。
 
