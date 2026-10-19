@@ -44,6 +44,7 @@ test("config falls back to defaults and clamps values", () => {
   assert.deepEqual(plain(config.nodes), MAINLAND);
   assert.equal(fn.parseConfig("mode=swap&open_range=clip").mode, "swap");
   assert.equal(fn.parseConfig("").threads, 8);
+  assert.equal(fn.parseConfig("").perNode, 3);
 });
 
 test("custom node list keeps only Bilibili video servers", () => {

@@ -1,7 +1,7 @@
 #!name=Bili Ripper
 #!desc=Moves Bilibili video downloads onto chosen upos nodes and splits each Range across several nodes at once. Based on github.com/MrTangLuyao/Bilibili-thread-ripper.
-#!arguments=Mode:fanout,Nodes:mainland,Threads:8,PerNode:1,ChunkKB:1024,OpenRange:swap,MaxMB:16,PCDN:REJECT
-#!arguments-desc=Mode: fanout (split ranges across nodes) or swap (only change the node).\nNodes: mainland, overseas, all, or hosts separated by |.\nThreads: parallel chunk requests per Range.\nPerNode: parallel requests allowed on one node.\nChunkKB: size of one chunk request.\nOpenRange: swap, or clip to answer an open Range with a bounded part.\nMaxMB: larger Ranges are only swapped.\nPCDN: REJECT blocks P2P/PCDN relays, DIRECT allows them.
+#!arguments=Mode:fanout,Nodes:mainland,Threads:8,PerNode:3,ChunkKB:1024,OpenRange:swap,MaxMB:16,PCDN:REJECT
+#!arguments-desc=Mode: fanout (split ranges across nodes) or swap (only change the node).\nNodes: mainland, overseas, all, or hosts separated by |.\nThreads: parallel chunk requests per Range.\nPerNode: parallel requests allowed on one node; raise it when only a few nodes are fast.\nChunkKB: size of one chunk request.\nOpenRange: swap, or clip to answer an open Range with a bounded part.\nMaxMB: larger Ranges are only swapped.\nPCDN: REJECT blocks P2P/PCDN relays, DIRECT allows them.
 
 [Rule]
 # P2P / PCDN relays carry their own signature and cannot be moved to an upos node.

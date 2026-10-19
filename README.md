@@ -13,7 +13,7 @@
 
 - 同一个文件固定落在少数几个节点上（按 path hash），未测速的节点优先被试，测过的按速度排序，测速 10 分钟后过期重测。
 - 一块比已经完成的块慢两倍以上（至少 1.5 秒；一块都没完成时等 5 秒）就再向另一个节点要一份，谁先回用谁，同时最多补发两份。被追赶的节点不算失败，只是速度估计降到它目前实际表现出来的值，排名自然靠后；挂住的连接因此不用等满 15 秒超时，慢但能用的节点也不会被误封。
-- 选节点按"每条流的预期速度"排：快节点的第二个并发位优先于慢节点的第一个，所以 `PerNode` 设成 2 比加 `Threads` 更划算。
+- 选节点按"每条流的预期速度"排：快节点的第二个并发位优先于慢节点的第一个，所以 `PerNode` 调高比加 `Threads` 更划算。
 - 节点连续失败两次封 5 分钟；`Bili Ripper Health` 脚本看响应状态，没有响应就重发的请求也算一次失败。
 - 两个以上节点同时 403 说明 B 站在限流这个 IP，fanout 停 2 分钟，期间只做 swap。
 - fanout 任何一步失败都回退到 swap，不会让请求直接失败。
@@ -33,13 +33,15 @@
 | `Mode` | `fanout` | `fanout` 或 `swap` |
 | `Nodes` | `mainland` | `mainland`、`overseas`、`all`，或用 `\|` 分隔的 host（只接受 `upos-*.bilivideo.com`、`upos-*.akamaized.net`、`cn-*.bilivideo.com`） |
 | `Threads` | `8` | 一个 Range 同时发几个块请求 |
-| `PerNode` | `1` | 同一节点同时几个请求 |
+| `PerNode` | `3` | 同一节点同时几个请求 |
 | `ChunkKB` | `1024` | 每块大小 |
 | `OpenRange` | `swap` | `swap` 或 `clip` |
 | `MaxMB` | `16` | 超过这个大小的 Range 只 swap |
 | `PCDN` | `REJECT` | 改成 `DIRECT` 就放行 PCDN |
 
-默认 8 线程配 `PerNode=1`，正好分到大陆预设的 8–9 个节点上，每个节点只开一个请求。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `refused by several nodes`，就把 `Threads` 调回 4。
+默认 8 线程配 `PerNode=3`：海外看的时候往往只有两三个节点真正快，`PerNode=1` 会强制把线程摊到慢节点上，每个 Range 都要等最慢那块；`PerNode=3` 让 8 条流基本都落在最快的几个节点上。实测（英国，`Nodes=all`）单个好节点约 1.8 MB/s，fanout 平均 4 到 6 MB/s。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `refused by several nodes`，就把 `Threads` 调回 4。
+
+`Threads` 不要开得太大：播放器会同时请求视频流和音频流的好几个 Range，峰值可能有四个 Range 一起 fanout，总流数是 `Threads` 的好几倍，链路一旦挤满，每条流都慢，追赶机制还会补发更多。
 
 ## 怎么确认在工作
 
@@ -51,7 +53,7 @@
 
 ```sh
 node --test dev/                       # unit tests with a fake CDN, no network
-node dev/live.js '<m4s url>' bytes=0-4194303 'threads=4&per_node=1'   # one real run
+node dev/live.js '<m4s url>' bytes=0-4194303 'threads=8&per_node=3'   # one real run
 ```
 
 `dev/harness.js` 按 Surge 的方式加载脚本：每次调用都是新的上下文，`$request`、`$response`、`$argument`、`$persistentStore`、`$httpClient`、`$done` 由外部提供。`live.js` 一次只跑一个请求，别循环跑，否则会触发上面说的 403 限流。

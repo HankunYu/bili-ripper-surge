@@ -78,7 +78,7 @@ function parseConfig(argument) {
     mode: raw.mode === "swap" ? "swap" : "fanout",
     nodes: parseNodes(raw.nodes),
     threads: clampInt(raw.threads, 1, 32, 8),
-    perNode: clampInt(raw.per_node, 1, 8, 1),
+    perNode: clampInt(raw.per_node, 1, 8, 3),
     chunkBytes: clampInt(raw.chunk_kb, 128, 8192, 1024) * 1024,
     openRange: raw.open_range === "clip" ? "clip" : "swap",
     maxBytes: clampInt(raw.max_mb, 1, 64, 16) * 1024 * 1024
