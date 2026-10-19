@@ -161,23 +161,98 @@ test("a fast node's second slot is preferred over a slow node's first", async ()
   assert.ok(Object.values(cdn.maxInflight).every((count) => count <= 2));
 });
 
-test("one refusing node is worked around, two trigger cooldown and fall back to swap", async () => {
+test("a file refused by two nodes goes to its original host; a second refused video pauses fanout", async () => {
   const store = createStore();
   const one = createCdn(4 * MB, (host) => (host === MAINLAND[0] ? 403 : "ok"));
   const ok = await runHook({ request: mediaRequest("bytes=0-2097151"), argument: "chunk_kb=512", store, http: one.get });
   assert.equal(ok.response.status, 206);
+  // The refusing node is not tried again for this file.
+  const second = createCdn(4 * MB);
+  await runHook({ request: mediaRequest("bytes=2097152-4194303"), argument: "chunk_kb=512", store, http: second.get });
+  assert.ok(second.calls.length > 0 && second.calls.every((call) => call.host !== MAINLAND[0]));
 
   const two = createCdn(4 * MB, () => 403);
-  const fallback = await runHook({ request: mediaRequest("bytes=2097152-4194303"), argument: "chunk_kb=512", store, http: two.get });
-  assert.equal(fallback.response, undefined);
-  assert.ok(MAINLAND.includes(hostOf(fallback.url)));
-  assert.ok(state(store).cooldown > Date.now());
-
-  // While cooling down, fanout is skipped entirely.
+  const fallback = await runHook({ request: mediaRequest("bytes=0-2097151"), argument: "chunk_kb=512", store, http: two.get });
+  assert.deepEqual(plain(fallback), {});
+  // One refused video is that video's problem: fanout goes on for others.
+  assert.equal(state(store).cooldown, 0);
+  // Every stream of that video now passes through untouched.
   const quiet = createCdn(4 * MB);
-  const swapped = await runHook({ request: mediaRequest("bytes=0-1048575", { url: AKAM_URL + "&n=2" }), argument: "chunk_kb=512", store, http: quiet.get });
+  const audio = AKAM_URL.replace("137649199_da2-1-30032.m4s", "137649199-1-30280.m4s");
+  const passed = await runHook({ request: mediaRequest("bytes=0-99", { url: audio }), argument: "mode=swap", store, http: quiet.get });
+  assert.deepEqual(plain(passed), {});
+  assert.equal(quiet.calls.length, 0);
+
+  // A second video refused right after means the address is throttled: fanout pauses.
+  const other = AKAM_URL.replace("/99/91/137649199/137649199_da2-1-30032.m4s", "/11/22/137650011/137650011-1-30080.m4s");
+  const refused = await runHook({ request: mediaRequest("bytes=0-2097151", { url: other }), argument: "chunk_kb=512", store, http: two.get });
+  assert.deepEqual(plain(refused), {});
+  const pause = state(store).cooldown - Date.now();
+  assert.ok(pause > 110000 && pause <= 120000, String(pause));
+  // While cooling down, fanout is skipped entirely.
+  const third = AKAM_URL.replace("/99/91/137649199/137649199_da2-1-30032.m4s", "/33/44/137654433/137654433-1-30080.m4s");
+  const swapped = await runHook({ request: mediaRequest("bytes=0-2097151", { url: third }), argument: "chunk_kb=512", store, http: quiet.get });
   assert.ok(swapped.url);
   assert.equal(quiet.calls.length, 0);
+});
+
+test("the pause doubles while videos keep being refused and resets once a fanout works", async () => {
+  const store = createStore();
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, refused: {}, refusals: 1 }), "bili-ripper.state");
+  const refuse = createCdn(4 * MB, () => 403);
+  for (const file of ["/11/22/137650011/137650011-1-30080.m4s", "/33/44/137654433/137654433-1-30080.m4s"]) {
+    const url = "https://upos-hz-mirrorakam.akamaized.net/upgcxcode" + file + QUERY;
+    await runHook({ request: mediaRequest("bytes=0-2097151", { url }), argument: "chunk_kb=512", store, http: refuse.get });
+  }
+  const pause = state(store).cooldown - Date.now();
+  assert.ok(pause > 230000 && pause <= 240000, String(pause));
+
+  const resumed = state(store);
+  resumed.cooldown = 0;
+  store.write(JSON.stringify(resumed), "bili-ripper.state");
+  const ok = await runHook({ request: mediaRequest("bytes=0-2097151"), argument: "chunk_kb=512", store, http: createCdn(4 * MB).get });
+  assert.equal(ok.response.status, 206);
+  assert.equal(state(store).refusals, 0);
+});
+
+test("no reply bans a node briefly, a server error for longer", async () => {
+  const blip = MAINLAND[0];
+  const broken = MAINLAND[1];
+  const cdn = createCdn(4 * MB, (host) => (host === blip ? "error" : host === broken ? 502 : "ok"));
+  const store = createStore();
+  // Each Range probes one unmeasured node, so the second failure comes on the next Range.
+  const nodes4 = "nodes=" + MAINLAND.slice(0, 4).join("|");
+  for (const range of ["bytes=0-2097151", "bytes=2097152-4194303"]) {
+    const result = await runHook({ request: mediaRequest(range), argument: nodes4 + "&threads=4&per_node=1&chunk_kb=256", store, http: cdn.get });
+    assert.equal(result.response.status, 206);
+  }
+  const nodes = state(store).nodes;
+  const now = Date.now();
+  assert.ok(nodes[blip].until > now && nodes[blip].until <= now + 60000, String(nodes[blip].until - now));
+  assert.ok(nodes[broken].until > now + 60000 && nodes[broken].until <= now + 300000, String(nodes[broken].until - now));
+});
+
+test("stale speeds still rank nodes, and one unmeasured node is probed per Range with one chunk", async () => {
+  const store = createStore();
+  const fast = MAINLAND.slice(0, 2);
+  const slow = MAINLAND[2];
+  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {} };
+  fast.forEach((host) => { seed.nodes[host] = { bps: 4e6, at: Date.now(), fail: 0, until: 0 }; });
+  seed.nodes[slow] = { bps: 1e5, at: Date.now() - 2 * 3600 * 1000, fail: 0, until: 0 };
+  store.write(JSON.stringify(seed), "bili-ripper.state");
+  const cdn = createCdn(8 * MB);
+  const result = await runHook({
+    request: mediaRequest("bytes=0-4194303"), argument: "threads=5&per_node=2&chunk_kb=512", store, http: cdn.get
+  });
+  assert.equal(result.response.status, 206);
+  // The first five launches fill the two fast nodes and probe exactly one other node once.
+  const opening = cdn.calls.slice(0, 5).map((call) => call.host);
+  const probed = opening.filter((host) => !fast.includes(host));
+  assert.equal(probed.length, 1, "opened with " + opening.join());
+  // A never-measured node is probed before the slow one, whose old speed still counts.
+  assert.notEqual(probed[0], slow);
+  assert.ok(!cdn.calls.some((call) => call.host === slow));
+  assert.ok(Object.values(cdn.maxInflight).every((count) => count <= 2));
 });
 
 test("a Range past the end of the file falls back without blaming nodes", async () => {
@@ -216,13 +291,30 @@ test("response hook bans a node after repeated failures", async () => {
   const store = createStore();
   const first = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
   const host = hostOf(first.url);
-  await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 403, headers: {} }, store });
+  await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 502, headers: {} }, store });
   const again = await runHook({ request: mediaRequest("bytes=2-3"), argument: "mode=swap", store });
   assert.equal(hostOf(again.url), host);
-  await runHook({ request: mediaRequest("bytes=2-3"), response: { status: 502, headers: {} }, store });
+  await runHook({ request: mediaRequest("bytes=2-3"), response: { status: 500, headers: {} }, store });
   assert.ok(state(store).nodes[host].until > Date.now());
   const moved = await runHook({ request: mediaRequest("bytes=4-5"), argument: "mode=swap", store });
   assert.notEqual(hostOf(moved.url), host);
+});
+
+test("a swapped request refused by a node moves the file elsewhere, then to its original host", async () => {
+  const store = createStore();
+  const first = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
+  const a = hostOf(first.url);
+  await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 403, headers: {} }, store });
+  const again = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
+  const b = hostOf(again.url);
+  assert.notEqual(b, a);
+  await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 404, headers: {} }, store });
+  const passed = await runHook({ request: mediaRequest("bytes=2-3"), argument: "mode=swap", store });
+  assert.deepEqual(plain(passed), {});
+  // A file nobody serves is not held against the nodes.
+  const nodes = state(store).nodes;
+  assert.equal(nodes[a].until, 0);
+  assert.ok(!nodes[b] || nodes[b].until === 0);
 });
 
 test("a repeated request without a response moves to another node", async () => {

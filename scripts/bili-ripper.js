@@ -6,11 +6,23 @@
 // One file serves two hooks: http-request (swap / fanout) and http-response (node health).
 
 const STATE_KEY = "bili-ripper.state";
+// A node that refused twice in a row is left alone for a while; one that merely gave no
+// reply is tried again much sooner, since that is usually a passing connection problem.
 const BAN_MS = 5 * 60 * 1000;
-// Bilibili refuses every node for about a minute after a burst from one address.
+const BLIP_BAN_MS = 60 * 1000;
+// A file refused by two nodes stays on its original host for this long: some files are only
+// served by the host Bilibili named. The record lives in state.refused, keyed by the file's
+// directory, which holds every stream of one video.
+const HOSTILE_MS = 10 * 60 * 1000;
+const MAX_REFUSED = 32;
+// Bilibili refuses every node for about a minute after a burst from one address. Two videos
+// refused within this window mean the address is throttled: fanout pauses, twice as long
+// each time it happens again, up to this many doublings.
 const COOLDOWN_MS = 2 * 60 * 1000;
-// A measured speed older than this is forgotten, so a node that was slow once is tried again.
-const SPEED_TTL_MS = 10 * 60 * 1000;
+const COOLDOWN_MAX_DOUBLINGS = 2;
+// A measured speed older than this still ranks the node, but it is measured again: one such
+// node per Range, one chunk at a time, so a slow one costs a hedged chunk, not the whole Range.
+const SPEED_TTL_MS = 60 * 60 * 1000;
 // A swapped request that got no response within this window is counted against its node.
 const STALE_ASSIGN_MS = 30 * 1000;
 const MAX_ASSIGNS = 64;
@@ -149,12 +161,16 @@ function loadState(now) {
   let state = null;
   try { state = JSON.parse($persistentStore.read(STATE_KEY) || "null"); } catch (_error) {}
   if (!state || state.v !== 1) state = { v: 1, nodes: {}, cooldown: 0, assigns: [] };
+  if (!state.refused) state.refused = {};
+  if (!state.refusals) state.refusals = 0;
   for (const host in state.nodes) {
     const node = state.nodes[host];
     if (node.until <= now) node.until = 0;
-    if (now - node.at > SPEED_TTL_MS) node.bps = 0;
   }
   state.assigns = state.assigns.filter((entry) => now - entry.at < STALE_ASSIGN_MS);
+  for (const dir in state.refused) {
+    if (now - state.refused[dir].at > HOSTILE_MS) delete state.refused[dir];
+  }
   return state;
 }
 
@@ -167,8 +183,8 @@ function nodeOf(state, host) {
   return state.nodes[host];
 }
 
-// Two failures in a row ban a node for a while; any success clears the count.
-function recordNode(state, host, ok, bps, now, reason) {
+// Two failures in a row ban a node for banMs; any success clears the count.
+function recordNode(state, host, ok, bps, now, reason, banMs) {
   const node = nodeOf(state, host);
   if (ok) {
     node.fail = 0;
@@ -179,11 +195,53 @@ function recordNode(state, host, ok, bps, now, reason) {
     return;
   }
   node.fail += 1;
+  node.seen = now;
   if (node.fail >= 2) {
+    const ms = banMs || BAN_MS;
     node.fail = 0;
-    node.until = now + BAN_MS;
-    console.log("[bili-ripper] banned " + host + " for " + BAN_MS / 60000 + " min after " + (reason || "failure"));
+    node.until = now + ms;
+    console.log("[bili-ripper] banned " + host + " for " + (ms >= 60000 ? ms / 60000 + " min" : ms / 1000 + " s")
+      + " after " + (reason || "failure"));
   }
+}
+
+// A 4xx other than 416 (a Range past the end, the request's own fault) is a refusal.
+function isRefusal(status) {
+  return status >= 400 && status < 500 && status !== 416;
+}
+
+// The directory holds every stream of one video, so a refusal of one covers the others.
+function dirOf(path) {
+  return path.slice(0, path.lastIndexOf("/") + 1);
+}
+
+function isHostile(state, path, now) {
+  const entry = state.refused[dirOf(path)];
+  return !!entry && entry.hosts.length >= 2 && now - entry.at <= HOSTILE_MS;
+}
+
+// Notes that a node refused a file. Returns true once the file counts as hostile, and starts
+// the cooldown when another video was refused just before: that is the address being throttled.
+function noteRefusal(state, path, host, now) {
+  const dir = dirOf(path);
+  const hostile = isHostile(state, path, now);
+  const entry = state.refused[dir] || (state.refused[dir] = { hosts: [], at: 0 });
+  if (entry.hosts.indexOf(host) < 0) entry.hosts.push(host);
+  entry.at = now;
+  const dirs = Object.keys(state.refused).sort((a, b) => state.refused[a].at - state.refused[b].at);
+  dirs.splice(0, Math.max(dirs.length - MAX_REFUSED, 0)).forEach((old) => { delete state.refused[old]; });
+  if (hostile || !isHostile(state, path, now)) return hostile;
+  const others = dirs.filter((other) => other !== dir && state.refused[other].hosts.length >= 2
+    && now - state.refused[other].at <= COOLDOWN_MS);
+  if (others.length) startCooldown(state, now);
+  return true;
+}
+
+function startCooldown(state, now) {
+  state.refusals = Math.min(state.refusals + 1, COOLDOWN_MAX_DOUBLINGS + 1);
+  const ms = COOLDOWN_MS * Math.pow(2, state.refusals - 1);
+  state.cooldown = now + ms;
+  console.log("[bili-ripper] several videos refused: no fanout for " + ms / 60000 + " min");
 }
 
 // Usable nodes, fastest first; never-measured nodes go first so each one gets measured.
@@ -252,7 +310,7 @@ function fetchChunk(job, host, chunk) {
       "binary-mode": true
     }, (error, response, data) => {
       if (error || !response) {
-        resolve({ ok: false, status: 0 });
+        resolve({ ok: false, status: 0, error: String(error || "empty response") });
         return;
       }
       const status = Number(response.status || response.statusCode) || 0;
@@ -274,15 +332,41 @@ function fetchChunk(job, host, chunk) {
   });
 }
 
+// When the node last answered or failed, so a failing node goes to the back of the probe queue.
+function lastContact(state, host) {
+  const node = state.nodes[host];
+  return node ? Math.max(node.at || 0, node.seen || 0) : 0;
+}
+
+function isFresh(state, host, now) {
+  const node = state.nodes[host];
+  return !!node && node.bps > 0 && now - node.at <= SPEED_TTL_MS;
+}
+
 // Fastest expected stream first: a fast node's second slot beats a slow node's first.
-// Never-measured nodes still go first so each one gets measured.
+// Nodes without a recent measurement are probed one per Range with a single chunk, the
+// longest unmeasured first. Only when nothing has a recent measurement do they all run.
 function pickChunkNode(job, chunk, freeOnly) {
-  const ranked = rankedNodes(job.config, job.state, Date.now(), chunk.tried);
+  const now = Date.now();
+  const refused = job.state.refused[dirOf(job.path)];
+  const ranked = rankedNodes(job.config, job.state, now, refused ? chunk.tried.concat(refused.hosts) : chunk.tried);
   const load = (host) => job.inflight[host] || 0;
-  const free = ranked.filter((host) => load(host) < job.config.perNode);
+  let pool = ranked;
+  if (ranked.some((host) => isFresh(job.state, host, now))) {
+    if (!job.probe) {
+      const unmeasured = ranked.filter((host) => !isFresh(job.state, host, now));
+      if (unmeasured.length) {
+        job.probe = unmeasured.sort((a, b) => lastContact(job.state, a) - lastContact(job.state, b))[0];
+      }
+    }
+    pool = ranked.filter((host) => host === job.probe || isFresh(job.state, host, now));
+  }
+  const limit = (host) => (host === job.probe ? 1 : job.config.perNode);
+  const free = pool.filter((host) => load(host) < limit(host));
   if (!free.length) {
     if (freeOnly) return null;
-    return ranked.slice().sort((a, b) => load(a) - load(b))[0];
+    const measured = pool.filter((host) => host !== job.probe);
+    return (measured.length ? measured : pool).slice().sort((a, b) => load(a) - load(b))[0];
   }
   const perStream = (host) => {
     const bps = job.state.nodes[host] && job.state.nodes[host].bps;
@@ -330,10 +414,17 @@ function fetchChunkRaced(job, chunk) {
         result.host = host;
         if (result.ok) {
           recordNode(job.state, host, true, result.bps, now);
-        } else if (result.status !== 416) {
-          // A Range past the end of the file is the request's fault, not the node's.
-          recordNode(job.state, host, false, 0, now, result.status ? "HTTP " + result.status : "no reply");
-          if (result.status === 403) job.refusedBy[host] = true;
+        } else if (result.status === 416 || (settled && !result.status)) {
+          // A Range past the end of the file is the request's fault, not the node's. A copy
+          // that lost the race and then got no reply was merely slow, and was marked down for it.
+        } else if (isRefusal(result.status)) {
+          // The file is blamed once two nodes have refused it; before that, the node is.
+          if (!noteRefusal(job.state, job.path, host, now)) {
+            recordNode(job.state, host, false, 0, now, "HTTP " + result.status, BAN_MS);
+          }
+        } else {
+          const reason = result.status ? "HTTP " + result.status : "no reply (" + result.error + ")";
+          recordNode(job.state, host, false, 0, now, reason, result.status ? BAN_MS : BLIP_BAN_MS);
         }
         if (settled) return;
         if (result.ok) {
@@ -367,8 +458,12 @@ function fetchChunkRaced(job, chunk) {
   });
 }
 
-function abortJob(job, reason) {
-  if (!job.aborted) job.aborted = new Error(reason);
+// An abort marked original sends the request to the host Bilibili named instead of a swap.
+function abortJob(job, reason, original) {
+  if (!job.aborted) {
+    job.aborted = new Error(reason);
+    job.aborted.original = !!original;
+  }
   throw job.aborted;
 }
 
@@ -389,11 +484,8 @@ async function worker(job, queue) {
       continue;
     }
     if (result.status === 416) abortJob(job, "range not satisfiable");
-    // Refusals from several nodes mean Bilibili is throttling this address: back off entirely.
-    if (Object.keys(job.refusedBy).length >= 2) {
-      job.state.cooldown = now + COOLDOWN_MS;
-      abortJob(job, "refused by several nodes");
-    }
+    // Refused by several nodes: only the original host is likely to serve this file.
+    if (isHostile(job.state, job.path, now)) abortJob(job, "refused by several nodes", true);
     chunk.attempts = chunk.tried.length;
     if (chunk.attempts >= MAX_ATTEMPTS) abortJob(job, "chunk failed " + chunk.attempts + " times");
     if (now - job.startedAt > FANOUT_BUDGET_MS) abortJob(job, "out of time");
@@ -412,9 +504,10 @@ function runChunks(job, chunks) {
 async function fanout(request, url, config, state, range) {
   const job = {
     target: url.path + url.query,
+    path: url.path,
     forward: forwardHeaders(request.headers),
     config, state,
-    inflight: {}, refusedBy: {}, hosts: {}, done: [],
+    inflight: {}, probe: null, hosts: {}, done: [],
     durations: [], hedges: 0, hedged: 0,
     total: 0, replyHeaders: null,
     startedAt: Date.now(), aborted: null
@@ -476,17 +569,29 @@ function onRequest() {
   const rangeHeader = header($request.headers, "range");
   const key = assignKey(url, rangeHeader);
 
-  // The same request again with no response for the last one: that node did not answer.
-  const exclude = [];
+  // A file the nodes refuse is left on the host Bilibili named.
+  const original = () => {
+    saveState(state);
+    $done({});
+  };
+  if (isHostile(state, url.path, now)) {
+    original();
+    return;
+  }
+
+  // Nodes that refused this file already, and the node that did not answer the same request
+  // last time, are not tried again for it.
+  const refused = state.refused[dirOf(url.path)];
+  const exclude = refused ? refused.hosts.slice() : [];
   const stale = state.assigns.filter((entry) => entry.key === key)[0];
   if (stale) {
-    recordNode(state, stale.host, false, 0, now, "no response to the last request");
-    exclude.push(stale.host);
+    recordNode(state, stale.host, false, 0, now, "no response to the last request", BLIP_BAN_MS);
+    if (exclude.indexOf(stale.host) < 0) exclude.push(stale.host);
     state.assigns = state.assigns.filter((entry) => entry !== stale);
   }
 
   const host = pickSwapNode(config, state, now, url, exclude);
-  const passThrough = () => {
+  const swap = () => {
     state.assigns.push({ key, host, at: Date.now() });
     if (state.assigns.length > MAX_ASSIGNS) state.assigns = state.assigns.slice(-MAX_ASSIGNS);
     saveState(state);
@@ -495,7 +600,7 @@ function onRequest() {
 
   const range = parseRange(rangeHeader);
   if (!fanoutEligible($request, config, state, range, now)) {
-    passThrough();
+    swap();
     return;
   }
   // Slow chunks must not run into Surge's script timeout: past the budget, swap instead.
@@ -503,11 +608,14 @@ function onRequest() {
     setTimeout(() => reject(new Error("out of time")), FANOUT_BUDGET_MS);
   });
   Promise.race([fanout($request, url, config, state, range), budget]).then((response) => {
+    state.refusals = 0;
     saveState(state);
     $done({ response });
   }, (error) => {
-    console.log("[bili-ripper] fanout fell back to swap: " + (error && error.message));
-    passThrough();
+    const where = error && error.original ? "the original host" : "swap";
+    console.log("[bili-ripper] fanout fell back to " + where + ": " + (error && error.message));
+    if (error && error.original) original();
+    else swap();
   });
 }
 
@@ -523,7 +631,11 @@ function onResponse() {
   const entry = state.assigns.filter((item) => item.key === key)[0];
   if (entry) {
     const status = Number($response.status || $response.statusCode) || 0;
-    recordNode(state, entry.host, status >= 200 && status < 400, 0, now, "HTTP " + status);
+    const ok = status >= 200 && status < 400;
+    // A refusal counts against the file once two nodes have refused it, else against the node.
+    if (ok || !isRefusal(status) || !noteRefusal(state, url.path, entry.host, now)) {
+      recordNode(state, entry.host, ok, 0, now, "HTTP " + status, BAN_MS);
+    }
     state.assigns = state.assigns.filter((item) => item !== entry);
     saveState(state);
   }
