@@ -1,0 +1,20 @@
+#!name=Bili Ripper
+#!desc=Moves Bilibili video downloads onto chosen upos nodes and splits each Range across several nodes at once. Based on github.com/MrTangLuyao/Bilibili-thread-ripper.
+#!arguments=Mode:fanout,Nodes:mainland,Threads:4,PerNode:1,ChunkKB:1024,OpenRange:swap,MaxMB:16,PCDN:REJECT
+#!arguments-desc=Mode: fanout (split ranges across nodes) or swap (only change the node).\nNodes: mainland, overseas, all, or hosts separated by |.\nThreads: parallel chunk requests per Range.\nPerNode: parallel requests allowed on one node.\nChunkKB: size of one chunk request.\nOpenRange: swap, or clip to answer an open Range with a bounded part.\nMaxMB: larger Ranges are only swapped.\nPCDN: REJECT blocks P2P/PCDN relays, DIRECT allows them.
+
+[Rule]
+# P2P / PCDN relays carry their own signature and cannot be moved to an upos node.
+DOMAIN-SUFFIX,mcdn.bilivideo.cn,{{{PCDN}}}
+DOMAIN-SUFFIX,szbdyd.com,{{{PCDN}}}
+DOMAIN-SUFFIX,mountaintoys.cn,{{{PCDN}}}
+# Media over QUIC bypasses MITM; refusing it makes clients fall back to TCP.
+AND,((PROTOCOL,UDP),(DEST-PORT,443),(DOMAIN-SUFFIX,bilivideo.com)),REJECT-NO-DROP
+AND,((PROTOCOL,UDP),(DEST-PORT,443),(DOMAIN-WILDCARD,upos-*.akamaized.net)),REJECT-NO-DROP
+
+[Script]
+Bili Ripper = type=http-request,pattern=^https:\/\/(?:upos-[a-z0-9-]+\.(?:bilivideo\.com|akamaized\.net)|cn-[a-z0-9-]+\.bilivideo\.com)(?::\d+)?\/(?:upgcxcode|ugaxcode)\/,requires-body=0,binary-body-mode=1,timeout=30,script-path=https://raw.githubusercontent.com/HankunYu/bili-ripper-surge/main/scripts/bili-ripper.js,argument="mode={{{Mode}}}&nodes={{{Nodes}}}&threads={{{Threads}}}&per_node={{{PerNode}}}&chunk_kb={{{ChunkKB}}}&open_range={{{OpenRange}}}&max_mb={{{MaxMB}}}"
+Bili Ripper Health = type=http-response,pattern=^https:\/\/(?:upos-[a-z0-9-]+\.(?:bilivideo\.com|akamaized\.net)|cn-[a-z0-9-]+\.bilivideo\.com)(?::\d+)?\/(?:upgcxcode|ugaxcode)\/,requires-body=0,timeout=5,script-path=https://raw.githubusercontent.com/HankunYu/bili-ripper-surge/main/scripts/bili-ripper.js
+
+[MITM]
+hostname = %APPEND% upos-*.bilivideo.com, cn-*.bilivideo.com, upos-*.akamaized.net
