@@ -168,7 +168,7 @@ function nodeOf(state, host) {
 }
 
 // Two failures in a row ban a node for a while; any success clears the count.
-function recordNode(state, host, ok, bps, now) {
+function recordNode(state, host, ok, bps, now, reason) {
   const node = nodeOf(state, host);
   if (ok) {
     node.fail = 0;
@@ -182,6 +182,7 @@ function recordNode(state, host, ok, bps, now) {
   if (node.fail >= 2) {
     node.fail = 0;
     node.until = now + BAN_MS;
+    console.log("[bili-ripper] banned " + host + " for " + BAN_MS / 60000 + " min after " + (reason || "failure"));
   }
 }
 
@@ -331,7 +332,7 @@ function fetchChunkRaced(job, chunk) {
           recordNode(job.state, host, true, result.bps, now);
         } else if (result.status !== 416) {
           // A Range past the end of the file is the request's fault, not the node's.
-          recordNode(job.state, host, false, 0, now);
+          recordNode(job.state, host, false, 0, now, result.status ? "HTTP " + result.status : "no reply");
           if (result.status === 403) job.refusedBy[host] = true;
         }
         if (settled) return;
@@ -447,6 +448,9 @@ async function fanout(request, url, config, state, range) {
   headers["Content-Length"] = String(body.length);
   headers["X-Bili-Ripper"] = "fanout chunks=" + job.done.length + " nodes=" + Object.keys(job.hosts).length
     + " hedged=" + job.hedged;
+  const ms = Date.now() - job.startedAt;
+  console.log("[bili-ripper] fanout " + Math.round(body.length / 1024) + "KB in " + ms + "ms ("
+    + Math.round(body.length / 1.024 / Math.max(ms, 1)) + "KB/s) " + headers["X-Bili-Ripper"].slice(7));
   return { status: 206, headers, body };
 }
 
@@ -476,7 +480,7 @@ function onRequest() {
   const exclude = [];
   const stale = state.assigns.filter((entry) => entry.key === key)[0];
   if (stale) {
-    recordNode(state, stale.host, false, 0, now);
+    recordNode(state, stale.host, false, 0, now, "no response to the last request");
     exclude.push(stale.host);
     state.assigns = state.assigns.filter((entry) => entry !== stale);
   }
@@ -519,7 +523,7 @@ function onResponse() {
   const entry = state.assigns.filter((item) => item.key === key)[0];
   if (entry) {
     const status = Number($response.status || $response.statusCode) || 0;
-    recordNode(state, entry.host, status >= 200 && status < 400, 0, now);
+    recordNode(state, entry.host, status >= 200 && status < 400, 0, now, "HTTP " + status);
     state.assigns = state.assigns.filter((item) => item !== entry);
     saveState(state);
   }
