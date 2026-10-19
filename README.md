@@ -16,7 +16,7 @@
 - 两个以上节点同时 403 说明 B 站在限流这个 IP，fanout 停 2 分钟，期间只做 swap。
 - fanout 任何一步失败都回退到 swap，不会让请求直接失败。
 - 太小（不到两块）、太大（超过 `MaxMB`）或开放的 Range（`bytes=a-`）默认只 swap。`OpenRange=clip` 时开放 Range 会先取一块拿到文件大小，再返回 `Threads × ChunkKB × 2` 字节的 206。这依赖播放器自己续读剩下的部分，属于实验功能。
-- P2P/PCDN 中转（`mcdn.bilivideo.cn`、`szbdyd.com`、`mountaintoys.cn`）默认 REJECT，逼客户端用 upos 备用地址。QUIC 也会被拒，让客户端走 TCP，这样才能被 MITM。
+- P2P/PCDN 中转（`mcdn.bilivideo.cn/com/net`、`szbdyd.com`、`xycdn.com`、`mountaintoys.cn`、`nexusedgeio.com`、`ahdohpiechei.com`，与上游一致）默认 REJECT，逼客户端用 upos 备用地址。QUIC 也会被拒，让客户端走 TCP，这样才能被 MITM。
 
 ## 安装
 
