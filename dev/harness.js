@@ -65,6 +65,7 @@ function createCdn(size, behaviour = () => "ok", replyHeaders = {}) {
       const verdict = behaviour(host, start, end);
       if (verdict === "hang") return;
       if (verdict === "error") return callback("connection reset", null, null);
+      if (verdict === "dns") return callback("Empty DNS answer for " + host + " from servers: 8.8.8.8", null, null);
       if (typeof verdict === "number") return callback(null, { status: verdict, headers: {} }, new Uint8Array(0));
       if (start >= size) return callback(null, { status: 416, headers: {} }, new Uint8Array(0));
       const last = Math.min(end, size - 1);

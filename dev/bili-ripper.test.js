@@ -47,6 +47,11 @@ test("config falls back to defaults and clamps values", () => {
   assert.equal(fn.parseConfig("").perNode, 3);
 });
 
+test("the mainland preset no longer lists the retired mirror08c node", () => {
+  assert.ok(!MAINLAND.includes("upos-sz-mirror08c.bilivideo.com"));
+  assert.ok(!plain(fn.parseNodes("all")).includes("upos-sz-mirror08c.bilivideo.com"));
+});
+
 test("custom node list keeps only Bilibili video servers", () => {
   const nodes = fn.parseNodes("upos-sz-mirrorcos.bilivideo.com|evil.example.com|upos-sz-mirrorcos.bilivideo.com|cn-hk-eq-01-01.bilivideo.com");
   assert.deepEqual(plain(nodes), ["upos-sz-mirrorcos.bilivideo.com", "cn-hk-eq-01-01.bilivideo.com"]);
@@ -292,12 +297,57 @@ test("response hook bans a node after repeated failures", async () => {
   const first = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
   const host = hostOf(first.url);
   await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 502, headers: {} }, store });
-  const again = await runHook({ request: mediaRequest("bytes=2-3"), argument: "mode=swap", store });
+  // One failure already moves the next request elsewhere; only this node is left to fail twice.
+  const moved = await runHook({ request: mediaRequest("bytes=2-3"), argument: "mode=swap", store });
+  assert.notEqual(hostOf(moved.url), host);
+  const only = "mode=swap&nodes=" + host;
+  const again = await runHook({ request: mediaRequest("bytes=2-3"), argument: only, store });
   assert.equal(hostOf(again.url), host);
   await runHook({ request: mediaRequest("bytes=2-3"), response: { status: 500, headers: {} }, store });
   assert.ok(state(store).nodes[host].until > Date.now());
-  const moved = await runHook({ request: mediaRequest("bytes=4-5"), argument: "mode=swap", store });
-  assert.notEqual(hostOf(moved.url), host);
+  const banned = await runHook({ request: mediaRequest("bytes=4-5"), argument: "mode=swap", store });
+  assert.notEqual(hostOf(banned.url), host);
+});
+
+test("bans double while a node keeps failing and reset after a success", () => {
+  const host = MAINLAND[0];
+  const seen = [];
+  for (let round = 0; round < 7; round++) {
+    const now = round * 1e6;
+    const st = { nodes: seen.length ? { [host]: seen[seen.length - 1].node } : {} };
+    fn.recordNode(st, host, false, 0, now, "no reply", 60000);
+    fn.recordNode(st, host, false, 0, now, "no reply", 60000);
+    seen.push({ ms: st.nodes[host].until - now, node: plain(st.nodes[host]) });
+  }
+  assert.deepEqual(seen.map((s) => s.ms / 60000), [1, 2, 4, 8, 16, 30, 30]);
+  const st = { nodes: { [host]: seen[seen.length - 1].node } };
+  fn.recordNode(st, host, true, 0, 7e6);
+  assert.equal(st.nodes[host].suspect, false);
+  fn.recordNode(st, host, false, 0, 8e6, "no reply", 60000);
+  fn.recordNode(st, host, false, 0, 8e6, "no reply", 60000);
+  assert.equal(st.nodes[host].until - 8e6, 60000);
+});
+
+test("a name that does not resolve bans the node as long as a server error", async () => {
+  const gone = MAINLAND[0];
+  const cdn = createCdn(4 * MB, (host) => (host === gone ? "dns" : "ok"));
+  const store = createStore();
+  const nodes4 = "nodes=" + MAINLAND.slice(0, 4).join("|");
+  for (const range of ["bytes=0-2097151", "bytes=2097152-4194303"]) {
+    const result = await runHook({ request: mediaRequest(range), argument: nodes4 + "&threads=4&per_node=1&chunk_kb=256", store, http: cdn.get });
+    assert.equal(result.response.status, 206);
+  }
+  const until = state(store).nodes[gone].until - Date.now();
+  assert.ok(until > 60000 && until <= 300000, String(until));
+});
+
+test("a node whose last contact failed ranks behind the others until it answers again", () => {
+  const config = fn.parseConfig("nodes=" + MAINLAND.slice(0, 3).join("|"));
+  const [a, b, c] = MAINLAND;
+  const st = { nodes: { [a]: { bps: 9e6, at: 1, fail: 1, until: 0, suspect: true }, [b]: { bps: 2e6, at: 1, fail: 0, until: 0 } } };
+  assert.deepEqual(plain(fn.rankedNodes(config, st, 2, [])), [c, b, a]);
+  fn.recordNode(st, a, true, 0, 3);
+  assert.deepEqual(plain(fn.rankedNodes(config, st, 4, [])), [c, a, b]);
 });
 
 test("a swapped request refused by a node moves the file elsewhere, then to its original host", async () => {

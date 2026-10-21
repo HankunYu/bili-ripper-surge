@@ -8,8 +8,11 @@
 const STATE_KEY = "bili-ripper.state";
 // A node that refused twice in a row is left alone for a while; one that merely gave no
 // reply is tried again much sooner, since that is usually a passing connection problem.
+// Each ban in a row lasts twice as long as the one before, up to BAN_MAX_MS, so a node that
+// is down for good stops being tried every minute; any success resets the run.
 const BAN_MS = 5 * 60 * 1000;
 const BLIP_BAN_MS = 60 * 1000;
+const BAN_MAX_MS = 30 * 60 * 1000;
 // A file refused by two nodes stays on its original host for this long: some files are only
 // served by the host Bilibili named. The record lives in state.refused, keyed by the file's
 // directory, which holds every stream of one video.
@@ -45,7 +48,6 @@ const PRESETS = {
     "upos-sz-mirrorali.bilivideo.com",
     "upos-sz-mirrorhw.bilivideo.com",
     "upos-sz-mirrorbos.bilivideo.com",
-    "upos-sz-mirror08c.bilivideo.com",
     "upos-sz-mirrorbd.bilivideo.com",
     "upos-sz-mirror14b.bilivideo.com",
     "upos-sz-estgoss.bilivideo.com",
@@ -183,11 +185,15 @@ function nodeOf(state, host) {
   return state.nodes[host];
 }
 
-// Two failures in a row ban a node for banMs; any success clears the count.
+// Two failures in a row ban a node for banMs, doubling with each ban in a row; any success
+// clears both counts. A node whose last contact was a failure is marked suspect and ranks
+// behind the others until it answers again, so the player is not sent to it first.
 function recordNode(state, host, ok, bps, now, reason, banMs) {
   const node = nodeOf(state, host);
   if (ok) {
     node.fail = 0;
+    node.bans = 0;
+    node.suspect = false;
     if (bps > 0) {
       node.bps = node.bps ? Math.round(node.bps * 0.7 + bps * 0.3) : Math.round(bps);
       node.at = now;
@@ -196,13 +202,19 @@ function recordNode(state, host, ok, bps, now, reason, banMs) {
   }
   node.fail += 1;
   node.seen = now;
+  node.suspect = true;
   if (node.fail >= 2) {
-    const ms = banMs || BAN_MS;
+    const ms = Math.min((banMs || BAN_MS) * Math.pow(2, node.bans || 0), BAN_MAX_MS);
     node.fail = 0;
+    node.bans = (node.bans || 0) + 1;
     node.until = now + ms;
     console.log("[bili-ripper] banned " + host + " for " + (ms >= 60000 ? ms / 60000 + " min" : ms / 1000 + " s")
-      + " after " + (reason || "failure"));
+      + " after " + (reason || "failure") + (node.bans > 1 ? " (ban " + node.bans + " in a row)" : ""));
   }
+}
+
+function isSuspect(state, host) {
+  return !!(state.nodes[host] && state.nodes[host].suspect);
 }
 
 // A 4xx other than 416 (a Range past the end, the request's own fault) is a refusal.
@@ -244,13 +256,16 @@ function startCooldown(state, now) {
   console.log("[bili-ripper] several videos refused: no fanout for " + ms / 60000 + " min");
 }
 
-// Usable nodes, fastest first; never-measured nodes go first so each one gets measured.
+// Usable nodes, fastest first; never-measured nodes go first so each one gets measured,
+// and nodes that failed last go behind every node that did not.
 function rankedNodes(config, state, now, exclude) {
   const allowed = config.nodes.filter((host) => exclude.indexOf(host) < 0);
   const healthy = allowed.filter((host) => !(state.nodes[host] && state.nodes[host].until > now));
   const pool = healthy.length ? healthy : allowed.length ? allowed : config.nodes.slice();
   const speed = (host) => (state.nodes[host] && state.nodes[host].bps) || Infinity;
-  return pool.slice().sort((a, b) => (speed(a) === speed(b) ? 0 : speed(b) > speed(a) ? 1 : -1));
+  const suspect = (host) => (isSuspect(state, host) ? 1 : 0);
+  return pool.slice().sort((a, b) => suspect(a) - suspect(b)
+    || (speed(a) === speed(b) ? 0 : speed(b) > speed(a) ? 1 : -1));
 }
 
 function assignKey(url, rangeHeader) {
@@ -372,7 +387,9 @@ function pickChunkNode(job, chunk, freeOnly) {
     const bps = job.state.nodes[host] && job.state.nodes[host].bps;
     return bps ? bps / (load(host) + 1) : Infinity;
   };
-  return free.slice().sort((a, b) => (perStream(a) === perStream(b) ? 0 : perStream(b) > perStream(a) ? 1 : -1))[0];
+  const suspect = (host) => (isSuspect(job.state, host) ? 1 : 0);
+  return free.slice().sort((a, b) => suspect(a) - suspect(b)
+    || (perStream(a) === perStream(b) ? 0 : perStream(b) > perStream(a) ? 1 : -1))[0];
 }
 
 // Caps a node's speed estimate at what a still-running chunk has achieved so far.
@@ -424,7 +441,9 @@ function fetchChunkRaced(job, chunk) {
           }
         } else {
           const reason = result.status ? "HTTP " + result.status : "no reply (" + result.error + ")";
-          recordNode(job.state, host, false, 0, now, reason, result.status ? BAN_MS : BLIP_BAN_MS);
+          // A name that does not resolve is a node that is gone, not a passing blip.
+          const hard = result.status || /\bdns\b/i.test(result.error || "");
+          recordNode(job.state, host, false, 0, now, reason, hard ? BAN_MS : BLIP_BAN_MS);
         }
         if (settled) return;
         if (result.ok) {
