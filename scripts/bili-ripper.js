@@ -28,6 +28,10 @@ const COOLDOWN_MAX_DOUBLINGS = 2;
 const SPEED_TTL_MS = 60 * 60 * 1000;
 // A swapped request that got no response within this window is counted against its node.
 const STALE_ASSIGN_MS = 30 * 1000;
+// A node may send the headers of a good reply and then no body; the player gives up and asks
+// for the same Range again. So a good status only counts once this window has passed without
+// the same Range being asked for again; a repeat inside it is counted against the node.
+const RETRY_WINDOW_MS = 10 * 1000;
 const MAX_ASSIGNS = 64;
 const MAX_ATTEMPTS = 3;
 const CHUNK_TIMEOUT_S = 15;
@@ -44,9 +48,12 @@ const FANOUT_BUDGET_MS = 25 * 1000;
 // sends nothing for about two seconds, then ask again: the first download is thrown away.
 // A Range the recent fanout speed cannot bring in within this time is swapped instead, so
 // the reply streams from its first byte. The speed is forgotten after FANOUT_SPEED_TTL_MS,
-// so a slow spell that stopped every fanout does not stop them for good.
+// so a slow spell that stopped every fanout does not stop them for good. The first fanouts
+// after a pause run on new connections and come out slow, so the speed only turns Ranges
+// away once it rests on this many fanouts.
 const FANOUT_TARGET_MS = 1500;
 const FANOUT_SPEED_TTL_MS = 10 * 60 * 1000;
+const FANOUT_MIN_SAMPLES = 3;
 // A Range is split into equal chunks, no larger than ChunkKB, and into up to Threads of them
 // while each stays at least this big: 1.1 MB becomes four even chunks, not 1 MB plus a tail.
 const MIN_CHUNK_BYTES = 256 * 1024;
@@ -179,7 +186,12 @@ function loadState(now) {
     const node = state.nodes[host];
     if (node.until <= now) node.until = 0;
   }
-  state.assigns = state.assigns.filter((entry) => now - entry.at < STALE_ASSIGN_MS);
+  state.assigns = state.assigns.filter((entry) => {
+    if (!entry.answered) return now - entry.at < STALE_ASSIGN_MS;
+    if (now - entry.answered < RETRY_WINDOW_MS) return true;
+    recordNode(state, entry.host, true, 0, now);
+    return false;
+  });
   for (const dir in state.refused) {
     if (now - state.refused[dir].at > HOSTILE_MS) delete state.refused[dir];
   }
@@ -289,11 +301,13 @@ function pickSwapNode(config, state, now, url, exclude) {
   return ranked[hashOf(url.path) % Math.min(SWAP_SPREAD, ranked.length)];
 }
 
+// Every node holds the same bytes under its own ETag, so an If-Range carried over from
+// another node never matches and the node answers 200 with the whole file instead of a part.
 function swappedHeaders(headers, host) {
   const result = {};
   for (const key in headers || {}) {
     const lower = key.toLowerCase();
-    if (lower !== "host" && lower !== ":authority") result[key] = headers[key];
+    if (lower !== "host" && lower !== ":authority" && lower !== "if-range") result[key] = headers[key];
   }
   result.Host = host;
   return result;
@@ -316,9 +330,10 @@ function evenChunkBytes(length, config) {
 }
 
 // The largest Range the recent fanout speed brings in within FANOUT_TARGET_MS; Infinity
-// while there is no recent speed.
+// while there is no recent speed or it rests on too few fanouts.
 function budgetBytes(state, now) {
   if (!state.fanoutBps || now - state.fanoutAt > FANOUT_SPEED_TTL_MS) return Infinity;
+  if ((state.fanoutSamples || 0) < FANOUT_MIN_SAMPLES) return Infinity;
   return Math.floor(state.fanoutBps * FANOUT_TARGET_MS / 1000);
 }
 
@@ -326,6 +341,7 @@ function recordFanout(state, bytes, ms, now) {
   const bps = bytes * 1000 / Math.max(ms, 1);
   const fresh = state.fanoutBps && now - state.fanoutAt <= FANOUT_SPEED_TTL_MS;
   state.fanoutBps = Math.round(fresh ? state.fanoutBps * 0.7 + bps * 0.3 : bps);
+  state.fanoutSamples = fresh ? (state.fanoutSamples || 0) + 1 : 1;
   state.fanoutAt = now;
 }
 
@@ -634,12 +650,13 @@ function onRequest() {
   }
 
   // Nodes that refused this file already, and the node that did not answer the same request
-  // last time, are not tried again for it.
+  // last time or answered it with headers the player then gave up on, are not tried again for it.
   const refused = state.refused[dirOf(url.path)];
   const exclude = refused ? refused.hosts.slice() : [];
   const stale = state.assigns.filter((entry) => entry.key === key)[0];
   if (stale) {
-    recordNode(state, stale.host, false, 0, now, "no response to the last request", BLIP_BAN_MS);
+    const reason = stale.answered ? "the same Range was asked for again after its reply" : "no response to the last request";
+    recordNode(state, stale.host, false, 0, now, reason, BLIP_BAN_MS);
     if (exclude.indexOf(stale.host) < 0) exclude.push(stale.host);
     state.assigns = state.assigns.filter((entry) => entry !== stale);
   }
@@ -682,15 +699,20 @@ function onResponse() {
   const now = Date.now();
   const state = loadState(now);
   const key = assignKey(url, header($request.headers, "range"));
-  const entry = state.assigns.filter((item) => item.key === key)[0];
+  const entry = state.assigns.filter((item) => item.key === key && !item.answered)[0];
   if (entry) {
     const status = Number($response.status || $response.statusCode) || 0;
     const ok = status >= 200 && status < 400;
-    // A refusal counts against the file once two nodes have refused it, else against the node.
-    if (ok || !isRefusal(status) || !noteRefusal(state, url.path, entry.host, now)) {
-      recordNode(state, entry.host, ok, 0, now, "HTTP " + status, BAN_MS);
+    if (ok) {
+      // Counted as a success once RETRY_WINDOW_MS passes without the same Range coming back.
+      entry.answered = now;
+    } else {
+      // A refusal counts against the file once two nodes have refused it, else against the node.
+      if (!isRefusal(status) || !noteRefusal(state, url.path, entry.host, now)) {
+        recordNode(state, entry.host, false, 0, now, "HTTP " + status, BAN_MS);
+      }
+      state.assigns = state.assigns.filter((item) => item !== entry);
     }
-    state.assigns = state.assigns.filter((item) => item !== entry);
     saveState(state);
   }
   $done({});

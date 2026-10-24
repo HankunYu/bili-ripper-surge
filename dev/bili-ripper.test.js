@@ -302,7 +302,7 @@ test("a Range is split into equal chunks, up to Threads while each stays at leas
 
 test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", async () => {
   const store = createStore();
-  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutAt: Date.now() };
+  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() };
   store.write(JSON.stringify(seed), "bili-ripper.state");
   const cdn = createCdn(16 * MB);
   // 4 MB at 2 MB/s would take 2 s.
@@ -323,6 +323,14 @@ test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", 
   assert.equal(again.response.status, 206);
   // A fanout with no earlier speed starts the estimate from its own.
   assert.ok(state(stale).fanoutBps > 0);
+  assert.equal(state(stale).fanoutSamples, 1);
+
+  // A speed from fewer than three fanouts does not turn Ranges away yet.
+  const young = createStore();
+  young.write(JSON.stringify(Object.assign({}, seed, { fanoutSamples: 2 })), "bili-ripper.state");
+  const early = await runHook({ request: mediaRequest("bytes=0-4194303"), store: young, http: createCdn(16 * MB).get });
+  assert.equal(early.response.status, 206);
+  assert.equal(state(young).fanoutSamples, 3);
 });
 
 test("clip answers an open Range with a bounded part", async () => {
@@ -341,7 +349,7 @@ test("clip answers an open Range with a bounded part", async () => {
 
   // With a recent fanout speed, the part is what that speed brings in within 1.5 s.
   const store = createStore();
-  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutAt: Date.now() }), "bili-ripper.state");
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
   const timed = await runHook({ request: mediaRequest("bytes=0-"), argument: "open_range=clip&chunk_kb=512", store, http: cdn.get });
   assert.equal(timed.response.headers["Content-Range"], "bytes 0-" + (3 * MB - 1) + "/" + 20 * MB);
 });
@@ -427,4 +435,43 @@ test("a repeated request without a response moves to another node", async () => 
   const retry = await runHook({ request: mediaRequest("bytes=0-99"), argument: "mode=swap", store });
   assert.notEqual(hostOf(retry.url), hostOf(first.url));
   assert.equal(state(store).nodes[hostOf(first.url)].fail, 1);
+});
+
+test("swap drops If-Range, since every node has its own ETag for the same bytes", async () => {
+  const request = mediaRequest("bytes=0-5929");
+  request.headers["If-Range"] = "\"1AC7C6B3B5939680055C2F27601BB2C4\"";
+  const result = await runHook({ request, argument: "mode=swap", store: createStore() });
+  assert.ok(result.url);
+  assert.equal(result.headers["If-Range"], undefined);
+  assert.equal(result.headers.Range, "bytes=0-5929");
+});
+
+test("the same Range asked for again soon after a good reply moves to another node", async () => {
+  const store = createStore();
+  const first = await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
+  const a = hostOf(first.url);
+  // Headers arrive, the body never does: the reply looks fine and counts for nothing yet.
+  await runHook({ request: mediaRequest("bytes=0-5929"), response: { status: 206, headers: {} }, store });
+  assert.ok(!state(store).nodes[a] || !state(store).nodes[a].fail);
+  const retry = await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
+  assert.notEqual(hostOf(retry.url), a);
+  assert.equal(state(store).nodes[a].fail, 1);
+  assert.equal(state(store).nodes[a].suspect, true);
+  // The node that failed is put behind the others for new Ranges too.
+  const next = await runHook({ request: mediaRequest("bytes=5930-9999"), argument: "mode=swap", store });
+  assert.notEqual(hostOf(next.url), a);
+});
+
+test("a good reply counts once the retry window passes without the same Range coming back", async () => {
+  const store = createStore();
+  const host = MAINLAND[0];
+  const now = Date.now();
+  store.write(JSON.stringify({
+    v: 1, cooldown: 0, nodes: { [host]: { bps: 1e6, at: now, fail: 1, until: 0, suspect: true } },
+    assigns: [{ key: PATH + "|bytes=0-5929", host, at: now - 15000, answered: now - 11000 }]
+  }), "bili-ripper.state");
+  await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
+  const node = state(store).nodes[host];
+  assert.equal(node.fail, 0);
+  assert.equal(node.suspect, false);
 });
