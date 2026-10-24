@@ -40,6 +40,16 @@ const HEDGE_MIN_MS = 1500;
 const HEDGE_FIRST_MS = 5000;
 const HEDGE_MAX_INFLIGHT = 2;
 const FANOUT_BUDGET_MS = 25 * 1000;
+// A fanout replies only once the whole Range is in, and players give up on a request that
+// sends nothing for about two seconds, then ask again: the first download is thrown away.
+// A Range the recent fanout speed cannot bring in within this time is swapped instead, so
+// the reply streams from its first byte. The speed is forgotten after FANOUT_SPEED_TTL_MS,
+// so a slow spell that stopped every fanout does not stop them for good.
+const FANOUT_TARGET_MS = 1500;
+const FANOUT_SPEED_TTL_MS = 10 * 60 * 1000;
+// A Range is split into equal chunks, no larger than ChunkKB, and into up to Threads of them
+// while each stays at least this big: 1.1 MB becomes four even chunks, not 1 MB plus a tail.
+const MIN_CHUNK_BYTES = 256 * 1024;
 // Swap mode spreads files over this many of the best nodes.
 const SWAP_SPREAD = 3;
 
@@ -299,9 +309,29 @@ function planChunks(start, end, chunkBytes) {
   return chunks;
 }
 
+function evenChunkBytes(length, config) {
+  const count = Math.max(Math.ceil(length / config.chunkBytes),
+    Math.min(config.threads, Math.floor(length / MIN_CHUNK_BYTES)), 1);
+  return Math.ceil(length / count);
+}
+
+// The largest Range the recent fanout speed brings in within FANOUT_TARGET_MS; Infinity
+// while there is no recent speed.
+function budgetBytes(state, now) {
+  if (!state.fanoutBps || now - state.fanoutAt > FANOUT_SPEED_TTL_MS) return Infinity;
+  return Math.floor(state.fanoutBps * FANOUT_TARGET_MS / 1000);
+}
+
+function recordFanout(state, bytes, ms, now) {
+  const bps = bytes * 1000 / Math.max(ms, 1);
+  const fresh = state.fanoutBps && now - state.fanoutAt <= FANOUT_SPEED_TTL_MS;
+  state.fanoutBps = Math.round(fresh ? state.fanoutBps * 0.7 + bps * 0.3 : bps);
+  state.fanoutAt = now;
+}
+
 // An open Range is answered with this much, so the reply arrives before the player gives up.
-function clipBytes(config) {
-  return config.threads * config.chunkBytes * 2;
+function clipBytes(config, state, now) {
+  return Math.min(config.threads * config.chunkBytes * 2, Math.max(budgetBytes(state, now), config.chunkBytes));
 }
 
 function forwardHeaders(headers) {
@@ -535,11 +565,11 @@ async function fanout(request, url, config, state, range) {
   if (end === null) {
     // The first chunk tells the file size, which an open Range leaves unknown.
     await runChunks(job, planChunks(range.start, range.start + config.chunkBytes - 1, config.chunkBytes));
-    end = Math.min(job.total - 1, range.start + clipBytes(config) - 1);
+    end = Math.min(job.total - 1, range.start + clipBytes(config, state, job.startedAt) - 1);
     const next = job.done[0].end + 1;
-    if (next <= end) await runChunks(job, planChunks(next, end, config.chunkBytes));
+    if (next <= end) await runChunks(job, planChunks(next, end, evenChunkBytes(end - next + 1, config)));
   } else {
-    await runChunks(job, planChunks(range.start, end, config.chunkBytes));
+    await runChunks(job, planChunks(range.start, end, evenChunkBytes(end - range.start + 1, config)));
   }
   end = Math.min(end, job.total - 1);
 
@@ -561,6 +591,7 @@ async function fanout(request, url, config, state, range) {
   headers["X-Bili-Ripper"] = "fanout chunks=" + job.done.length + " nodes=" + Object.keys(job.hosts).length
     + " hedged=" + job.hedged;
   const ms = Date.now() - job.startedAt;
+  recordFanout(state, body.length, ms, Date.now());
   console.log("[bili-ripper] fanout " + Math.round(body.length / 1024) + "KB in " + ms + "ms ("
     + Math.round(body.length / 1.024 / Math.max(ms, 1)) + "KB/s) " + headers["X-Bili-Ripper"].slice(7));
   return { status: 206, headers, body };
@@ -571,7 +602,11 @@ function fanoutEligible(request, config, state, range, now) {
   if (!range || state.cooldown > now) return false;
   if (range.end === null) return config.openRange === "clip";
   const length = range.end - range.start + 1;
-  return length > config.chunkBytes && length <= config.maxBytes;
+  if (length <= config.chunkBytes || length > config.maxBytes) return false;
+  if (length <= budgetBytes(state, now)) return true;
+  console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: fanout at "
+    + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
+  return false;
 }
 
 // ---- hooks ----

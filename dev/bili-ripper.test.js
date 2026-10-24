@@ -277,6 +277,54 @@ test("small, oversized and open Ranges are swapped by default", async () => {
   assert.equal(cdn.calls.length, 0);
 });
 
+test("a Range is split into equal chunks, up to Threads while each stays at least 256 KB", async () => {
+  const sizes = (length, argument) => {
+    const config = fn.parseConfig(argument);
+    return plain(fn.planChunks(0, length - 1, fn.evenChunkBytes(length, config)).map((c) => c.end - c.start + 1));
+  };
+  // 1.1 MB: four even chunks instead of 1 MB plus a 100 KB tail.
+  const small = sizes(1188 * KB, "");
+  assert.equal(small.length, 4);
+  assert.ok(Math.max(...small) - Math.min(...small) <= 3, String(small));
+  // Never larger than ChunkKB, even when that means more chunks than threads.
+  assert.deepEqual(sizes(3 * MB, "threads=4&chunk_kb=512"), Array(6).fill(512 * KB));
+  assert.equal(sizes(10 * MB, "").length, 10);
+  // Each chunk stays at least 256 KB.
+  assert.equal(sizes(700 * KB, "chunk_kb=128").length, 6);
+  assert.equal(sizes(600 * KB, "threads=8&chunk_kb=1024").length, 2);
+
+  const cdn = createCdn(4 * MB);
+  const result = await runHook({ request: mediaRequest("bytes=0-1216511"), store: createStore(), http: cdn.get });
+  assert.equal(result.response.headers["Content-Length"], String(1216512));
+  assert.equal(cdn.calls.length, 4);
+  assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 1216512)));
+});
+
+test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", async () => {
+  const store = createStore();
+  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutAt: Date.now() };
+  store.write(JSON.stringify(seed), "bili-ripper.state");
+  const cdn = createCdn(16 * MB);
+  // 4 MB at 2 MB/s would take 2 s.
+  const swapped = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  assert.ok(swapped.url);
+  assert.equal(cdn.calls.length, 0);
+  // 3 MB fits, and the fanout updates the speed.
+  const fanned = await runHook({ request: mediaRequest("bytes=0-3145727"), store, http: cdn.get });
+  assert.equal(fanned.response.status, 206);
+  const after = state(store);
+  assert.ok(after.fanoutAt >= seed.fanoutAt);
+  assert.notEqual(after.fanoutBps, 2 * MB);
+
+  // An old speed is forgotten: the same 4 MB fans out again.
+  const stale = createStore();
+  stale.write(JSON.stringify(Object.assign({}, seed, { fanoutAt: Date.now() - 11 * 60 * 1000 })), "bili-ripper.state");
+  const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store: stale, http: createCdn(16 * MB).get });
+  assert.equal(again.response.status, 206);
+  // A fanout with no earlier speed starts the estimate from its own.
+  assert.ok(state(stale).fanoutBps > 0);
+});
+
 test("clip answers an open Range with a bounded part", async () => {
   const cdn = createCdn(20 * MB);
   const result = await runHook({
@@ -290,6 +338,12 @@ test("clip answers an open Range with a bounded part", async () => {
   const tiny = createCdn(300 * KB);
   const small = await runHook({ request: mediaRequest("bytes=0-"), argument: "open_range=clip", store: createStore(), http: tiny.get });
   assert.equal(small.response.headers["Content-Range"], "bytes 0-" + (300 * KB - 1) + "/" + 300 * KB);
+
+  // With a recent fanout speed, the part is what that speed brings in within 1.5 s.
+  const store = createStore();
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutAt: Date.now() }), "bili-ripper.state");
+  const timed = await runHook({ request: mediaRequest("bytes=0-"), argument: "open_range=clip&chunk_kb=512", store, http: cdn.get });
+  assert.equal(timed.response.headers["Content-Range"], "bytes 0-" + (3 * MB - 1) + "/" + 20 * MB);
 });
 
 test("response hook bans a node after repeated failures", async () => {

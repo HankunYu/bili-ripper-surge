@@ -9,7 +9,7 @@
 | 模式 | 做什么 | 代价 |
 | --- | --- | --- |
 | `swap` | 只把请求的 host 换成选中的节点，响应照常流式返回 | 几乎没有 |
-| `fanout`（默认） | 有界 Range（`bytes=a-b`）拆成 `ChunkKB` 大小的块，最多 `Threads` 个请求同时打到不同节点，校验 `Content-Range` 和长度后拼成一个 206 | 要等整段下完才返回，首字节晚一些 |
+| `fanout`（默认） | 有界 Range（`bytes=a-b`）均分成若干块（每块不超过 `ChunkKB`），最多 `Threads` 个请求同时打到不同节点，校验 `Content-Range` 和长度后拼成一个 206 | 要等整段下完才返回，首字节晚一些 |
 
 - 同一个文件固定落在少数几个节点上（按 path hash），测过的节点按速度排序。测速一小时内算新鲜；过期的不清零，仍按旧速度排，但每个 Range 会拿一块去重测一个最久没碰的节点（没测过的最先），所以慢节点最多拖慢一块、还有补发兜底，不会再把整个 Range 摊到它头上。只有一个新鲜节点都没有时才全体并发。最近一次联系以失败告终的节点排在所有没失败的节点后面，直到它再次成功应答为止，所以 swap 不会把播放器先送到一个刚失败过的节点上。
 - 一块比已经完成的块慢两倍以上（至少 1.5 秒；一块都没完成时等 5 秒）就再向另一个节点要一份，谁先回用谁，同时最多补发两份。被追赶的节点不算失败，只是速度估计降到它目前实际表现出来的值，排名自然靠后；挂住的连接因此不用等满 15 秒超时，慢但能用的节点也不会被误封。
@@ -18,7 +18,9 @@
 - 一个节点 4xx 拒绝某个视频后，这个视频不再分给它；两个节点都拒绝，说明这个文件只有 B 站指定的主机肯给，之后 10 分钟内这个视频（音视频流都算）直接放行原主机，节点也不因此被封。
 - 2 分钟内两个不同的视频都被这样拒绝，说明 B 站在限流这个 IP：fanout 停 2 分钟，期间只做 swap；连着发生就停 4、8 分钟，fanout 成功一次后重新从 2 分钟起算。
 - fanout 任何一步失败都回退到 swap（被多个节点拒绝的回退到原主机），不会让请求直接失败。
-- 太小（不到两块）、太大（超过 `MaxMB`）或开放的 Range（`bytes=a-`）默认只 swap。`OpenRange=clip` 时开放 Range 会先取一块拿到文件大小，再返回 `Threads × ChunkKB × 2` 字节的 206。这依赖播放器自己续读剩下的部分，属于实验功能。
+- 切块是均分的：块数取「按 `ChunkKB` 切要几块」和「`Threads` 个、但每块不小于 256 KB」里大的那个，所以 1.1 MB 会切成 4 块各约 300 KB 并行下，而不是 1 MB 加一个 100 KB 的尾巴。
+- 播放器一个请求大约 2 秒收不到字节就会放弃重发，fanout 要整段下完才回，超过这个时间那份就白下了（日志里对应 Surge 主日志的 `Stream was already closed`）。所以脚本记着最近 fanout 的整体速度（10 分钟内有效），预计 1.5 秒内下不完的 Range 直接 swap，让数据边下边给，脚本日志里是 `swapped NKB: fanout at …KB/s would take …ms`。没有近期速度时只看 `MaxMB`。
+- 太小（不到两块）、太大（超过 `MaxMB`）或开放的 Range（`bytes=a-`）默认只 swap。`OpenRange=clip` 时开放 Range 会先取一块拿到文件大小，再返回 `Threads × ChunkKB × 2` 字节的 206（有近期速度时不超过 1.5 秒能下完的量）。这依赖播放器自己续读剩下的部分，属于实验功能。
 - P2P/PCDN 中转（`mcdn.bilivideo.cn/com/net`、`szbdyd.com`、`xycdn.com`、`mountaintoys.cn`、`nexusedgeio.com`、`ahdohpiechei.com`，与上游一致）默认 REJECT，逼客户端用 upos 备用地址。QUIC 也会被拒，让客户端走 TCP，这样才能被 MITM。
 
 ## 安装
@@ -35,9 +37,9 @@
 | `Nodes` | `mainland` | `mainland`、`overseas`、`all`，或用 `\|` 分隔的 host（只接受 `upos-*.bilivideo.com`、`upos-*.akamaized.net`、`cn-*.bilivideo.com`） |
 | `Threads` | `8` | 一个 Range 同时发几个块请求 |
 | `PerNode` | `3` | 同一节点同时几个请求 |
-| `ChunkKB` | `1024` | 每块大小 |
+| `ChunkKB` | `1024` | 每块最大大小 |
 | `OpenRange` | `swap` | `swap` 或 `clip` |
-| `MaxMB` | `16` | 超过这个大小的 Range 只 swap |
+| `MaxMB` | `16` | 超过这个大小的 Range 只 swap（按速度预计超过 1.5 秒的也会 swap） |
 | `PCDN` | `REJECT` | 改成 `DIRECT` 就放行 PCDN |
 
 默认 8 线程配 `PerNode=3`：海外看的时候往往只有两三个节点真正快，`PerNode=1` 会强制把线程摊到慢节点上，每个 Range 都要等最慢那块；`PerNode=3` 让 8 条流基本都落在最快的几个节点上。实测（英国，`Nodes=all`）单个好节点约 1.8 MB/s，fanout 平均 4 到 6 MB/s。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `several videos refused`，就把 `Threads` 调回 4。
