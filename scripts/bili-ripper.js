@@ -54,6 +54,19 @@ const FANOUT_BUDGET_MS = 25 * 1000;
 const FANOUT_TARGET_MS = 1500;
 const FANOUT_SPEED_TTL_MS = 10 * 60 * 1000;
 const FANOUT_MIN_SAMPLES = 3;
+// Only some players give up early: AVPlayer-based clients (Apple TV) wait for the whole reply,
+// and for them a swap to one slow node is worse than a fanout that answers late. A client is
+// known by its User-Agent and counts as impatient once it asks for a Range again while the
+// fanout for that Range is still running; only then does FANOUT_TARGET_MS apply to it. A
+// patient client gets PATIENT_TARGET_MS, so a fanout too slow to finish within the script's
+// FANOUT_BUDGET_MS is swapped up front instead of thrown away at the end. The
+// record lives under its own key and is read and written in one step, so the fanout that is
+// still running cannot overwrite it when it saves its state.
+const PATIENT_TARGET_MS = 15 * 1000;
+const CLIENTS_KEY = "bili-ripper.clients";
+const IMPATIENT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const MAX_CLIENTS = 16;
+const MAX_RUNNING = 32;
 // A Range is split into equal chunks, no larger than ChunkKB, and into up to Threads of them
 // while each stays at least this big: 1.1 MB becomes four even chunks, not 1 MB plus a tail.
 const MIN_CHUNK_BYTES = 256 * 1024;
@@ -202,6 +215,57 @@ function saveState(state) {
   try { $persistentStore.write(JSON.stringify(state), STATE_KEY); } catch (_error) {}
 }
 
+// ---- clients ----
+
+function loadClients(now) {
+  let clients = null;
+  try { clients = JSON.parse($persistentStore.read(CLIENTS_KEY) || "null"); } catch (_error) {}
+  if (!clients || typeof clients !== "object") clients = {};
+  const running = Array.isArray(clients.running) ? clients.running : [];
+  clients.running = running.filter((entry) => now - entry.at < FANOUT_BUDGET_MS).slice(-MAX_RUNNING);
+  const impatient = clients.impatient && typeof clients.impatient === "object" ? clients.impatient : {};
+  clients.impatient = {};
+  Object.keys(impatient).filter((agent) => now - impatient[agent] < IMPATIENT_TTL_MS)
+    .sort((a, b) => impatient[b] - impatient[a]).slice(0, MAX_CLIENTS)
+    .forEach((agent) => { clients.impatient[agent] = impatient[agent]; });
+  return clients;
+}
+
+function saveClients(clients) {
+  try { $persistentStore.write(JSON.stringify(clients), CLIENTS_KEY); } catch (_error) {}
+}
+
+function agentOf(headers) {
+  return hashOf(String(header(headers, "user-agent") || "")).toString(36);
+}
+
+// Notes a request, marking its client impatient when the same Range is still being fanned
+// out for it. Returns whether the client is impatient.
+function noteClient(agent, key, now) {
+  const clients = loadClients(now);
+  const repeat = clients.running.some((entry) => entry.key === key && entry.agent === agent);
+  if (repeat) {
+    if (!clients.impatient[agent]) console.log("[bili-ripper] client " + agent + " gives up on slow replies: fanouts for it now stay within " + FANOUT_TARGET_MS + "ms");
+    clients.impatient[agent] = now;
+    saveClients(clients);
+  }
+  return !!clients.impatient[agent];
+}
+
+function beginFanout(agent, key, now) {
+  const clients = loadClients(now);
+  const entry = { agent, key, at: now };
+  clients.running.push(entry);
+  saveClients(clients);
+  return entry;
+}
+
+function endFanout(entry) {
+  const clients = loadClients(Date.now());
+  clients.running = clients.running.filter((item) => !(item.key === entry.key && item.agent === entry.agent && item.at === entry.at));
+  saveClients(clients);
+}
+
 function nodeOf(state, host) {
   if (!state.nodes[host]) state.nodes[host] = { bps: 0, at: 0, fail: 0, until: 0 };
   return state.nodes[host];
@@ -329,12 +393,12 @@ function evenChunkBytes(length, config) {
   return Math.ceil(length / count);
 }
 
-// The largest Range the recent fanout speed brings in within FANOUT_TARGET_MS; Infinity
-// while there is no recent speed or it rests on too few fanouts.
-function budgetBytes(state, now) {
+// The largest Range the recent fanout speed brings in within the client's target time;
+// Infinity while there is no recent speed or it rests on too few fanouts.
+function budgetBytes(state, now, impatient) {
   if (!state.fanoutBps || now - state.fanoutAt > FANOUT_SPEED_TTL_MS) return Infinity;
   if ((state.fanoutSamples || 0) < FANOUT_MIN_SAMPLES) return Infinity;
-  return Math.floor(state.fanoutBps * FANOUT_TARGET_MS / 1000);
+  return Math.floor(state.fanoutBps * (impatient ? FANOUT_TARGET_MS : PATIENT_TARGET_MS) / 1000);
 }
 
 function recordFanout(state, bytes, ms, now) {
@@ -346,8 +410,8 @@ function recordFanout(state, bytes, ms, now) {
 }
 
 // An open Range is answered with this much, so the reply arrives before the player gives up.
-function clipBytes(config, state, now) {
-  return Math.min(config.threads * config.chunkBytes * 2, Math.max(budgetBytes(state, now), config.chunkBytes));
+function clipBytes(config, state, now, impatient) {
+  return Math.min(config.threads * config.chunkBytes * 2, Math.max(budgetBytes(state, now, impatient), config.chunkBytes));
 }
 
 function forwardHeaders(headers) {
@@ -566,7 +630,7 @@ function runChunks(job, chunks) {
   return Promise.all(runs);
 }
 
-async function fanout(request, url, config, state, range) {
+async function fanout(request, url, config, state, range, impatient) {
   const job = {
     target: url.path + url.query,
     path: url.path,
@@ -581,7 +645,7 @@ async function fanout(request, url, config, state, range) {
   if (end === null) {
     // The first chunk tells the file size, which an open Range leaves unknown.
     await runChunks(job, planChunks(range.start, range.start + config.chunkBytes - 1, config.chunkBytes));
-    end = Math.min(job.total - 1, range.start + clipBytes(config, state, job.startedAt) - 1);
+    end = Math.min(job.total - 1, range.start + clipBytes(config, state, job.startedAt, impatient) - 1);
     const next = job.done[0].end + 1;
     if (next <= end) await runChunks(job, planChunks(next, end, evenChunkBytes(end - next + 1, config)));
   } else {
@@ -613,14 +677,14 @@ async function fanout(request, url, config, state, range) {
   return { status: 206, headers, body };
 }
 
-function fanoutEligible(request, config, state, range, now) {
+function fanoutEligible(request, config, state, range, now, impatient) {
   if (config.mode !== "fanout" || String(request.method || "GET").toUpperCase() !== "GET") return false;
   if (!range || state.cooldown > now) return false;
   if (range.end === null) return config.openRange === "clip";
   const length = range.end - range.start + 1;
   if (length <= config.chunkBytes || length > config.maxBytes) return false;
-  if (length <= budgetBytes(state, now)) return true;
-  console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: fanout at "
+  if (length <= budgetBytes(state, now, impatient)) return true;
+  console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB" + (impatient ? "" : " (patient client)") + ": fanout at "
     + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
   return false;
 }
@@ -670,7 +734,9 @@ function onRequest() {
   };
 
   const range = parseRange(rangeHeader);
-  if (!fanoutEligible($request, config, state, range, now)) {
+  const agent = agentOf($request.headers);
+  const impatient = noteClient(agent, key, now);
+  if (!fanoutEligible($request, config, state, range, now, impatient)) {
     swap();
     return;
   }
@@ -678,11 +744,14 @@ function onRequest() {
   const budget = new Promise((_resolve, reject) => {
     setTimeout(() => reject(new Error("out of time")), FANOUT_BUDGET_MS);
   });
-  Promise.race([fanout($request, url, config, state, range), budget]).then((response) => {
+  const running = beginFanout(agent, key, now);
+  Promise.race([fanout($request, url, config, state, range, impatient), budget]).then((response) => {
+    endFanout(running);
     state.refusals = 0;
     saveState(state);
     $done({ response });
   }, (error) => {
+    endFanout(running);
     const where = error && error.original ? "the original host" : "swap";
     console.log("[bili-ripper] fanout fell back to " + where + ": " + (error && error.message));
     if (error && error.original) original();

@@ -33,6 +33,16 @@ function state(store) {
   return JSON.parse(store.read("bili-ripper.state"));
 }
 
+function clients(store) {
+  return JSON.parse(store.read("bili-ripper.clients") || "null");
+}
+
+// Marks the test User-Agent as a client that gives up on slow replies.
+function markImpatient(store, userAgent = "Mozilla/5.0 Chrome/130") {
+  const agent = fn.agentOf({ "User-Agent": userAgent });
+  store.write(JSON.stringify({ running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
+}
+
 test("config falls back to defaults and clamps values", () => {
   const config = fn.parseConfig("mode={{{Mode}}}&threads=999&per_node=0&chunk_kb=&max_mb=8");
   assert.equal(config.mode, "fanout");
@@ -300,10 +310,11 @@ test("a Range is split into equal chunks, up to Threads while each stays at leas
   assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 1216512)));
 });
 
-test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", async () => {
+test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped for an impatient client", async () => {
   const store = createStore();
   const seed = { v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() };
   store.write(JSON.stringify(seed), "bili-ripper.state");
+  markImpatient(store);
   const cdn = createCdn(16 * MB);
   // 4 MB at 2 MB/s would take 2 s.
   const swapped = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
@@ -318,6 +329,7 @@ test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", 
 
   // An old speed is forgotten: the same 4 MB fans out again.
   const stale = createStore();
+  markImpatient(stale);
   stale.write(JSON.stringify(Object.assign({}, seed, { fanoutAt: Date.now() - 11 * 60 * 1000 })), "bili-ripper.state");
   const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store: stale, http: createCdn(16 * MB).get });
   assert.equal(again.response.status, 206);
@@ -327,6 +339,7 @@ test("a Range the recent fanout speed cannot bring in within 1.5 s is swapped", 
 
   // A speed from fewer than three fanouts does not turn Ranges away yet.
   const young = createStore();
+  markImpatient(young);
   young.write(JSON.stringify(Object.assign({}, seed, { fanoutSamples: 2 })), "bili-ripper.state");
   const early = await runHook({ request: mediaRequest("bytes=0-4194303"), store: young, http: createCdn(16 * MB).get });
   assert.equal(early.response.status, 206);
@@ -349,6 +362,7 @@ test("clip answers an open Range with a bounded part", async () => {
 
   // With a recent fanout speed, the part is what that speed brings in within 1.5 s.
   const store = createStore();
+  markImpatient(store);
   store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
   const timed = await runHook({ request: mediaRequest("bytes=0-"), argument: "open_range=clip&chunk_kb=512", store, http: cdn.get });
   assert.equal(timed.response.headers["Content-Range"], "bytes 0-" + (3 * MB - 1) + "/" + 20 * MB);
@@ -474,4 +488,52 @@ test("a good reply counts once the retry window passes without the same Range co
   const node = state(store).nodes[host];
   assert.equal(node.fail, 0);
   assert.equal(node.suspect, false);
+});
+
+test("a patient client fans out Ranges too slow for 1.5 s, but not ones too slow for 15 s", async () => {
+  const store = createStore();
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 512 * KB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
+  const cdn = createCdn(16 * MB);
+  // 4 MB at 512 KB/s takes 8 s: fine for a client that waits for the whole reply.
+  const fanned = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  assert.equal(fanned.response.status, 206);
+  // Its record is gone once the fanout has answered.
+  assert.deepEqual(clients(store).running, []);
+  // 12 MB would take about 24 s, past the script's own budget.
+  const fresh = createStore();
+  fresh.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 512 * KB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
+  const swapped = await runHook({ request: mediaRequest("bytes=0-12582911"), store: fresh, http: createCdn(16 * MB).get });
+  assert.ok(swapped.url);
+});
+
+test("a client that asks for a Range again while its fanout runs counts as impatient", async () => {
+  const store = createStore();
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
+  const cdn = createCdn(16 * MB);
+  // Chunk replies are held back, so the first fanout is still running.
+  const held = [];
+  const first = runHook({ request: mediaRequest("bytes=0-4194303"), store, http: (options, callback) => held.push([options, callback]) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(held.length > 0);
+  assert.equal(clients(store).running.length, 1);
+
+  // The player gave up and asks again: 4 MB at 2 MB/s is too slow for it now.
+  const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  assert.ok(again.url);
+  const agent = fn.agentOf({ "User-Agent": "Mozilla/5.0 Chrome/130" });
+  assert.ok(clients(store).impatient[agent] > 0);
+
+  // Another client is not affected.
+  const other = await runHook({
+    request: mediaRequest("bytes=0-4194303", { headers: Object.assign(mediaRequest().headers, { "User-Agent": "AppleCoreMedia/1.0", Range: "bytes=0-4194303" }) }),
+    store, http: cdn.get
+  });
+  assert.equal(other.response.status, 206);
+
+  held.forEach(([options, callback]) => cdn.get(options, callback));
+  const done = await first;
+  assert.equal(done.response.status, 206);
+  // The finished fanout saved its state without losing the mark.
+  assert.ok(clients(store).impatient[agent] > 0);
+  assert.deepEqual(clients(store).running.filter((entry) => entry.agent === agent), []);
 });

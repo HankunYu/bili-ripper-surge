@@ -19,8 +19,9 @@
 - 2 分钟内两个不同的视频都被这样拒绝，说明 B 站在限流这个 IP：fanout 停 2 分钟，期间只做 swap；连着发生就停 4、8 分钟，fanout 成功一次后重新从 2 分钟起算。
 - fanout 任何一步失败都回退到 swap（被多个节点拒绝的回退到原主机），不会让请求直接失败。
 - 切块是均分的：块数取「按 `ChunkKB` 切要几块」和「`Threads` 个、但每块不小于 256 KB」里大的那个，所以 1.1 MB 会切成 4 块各约 300 KB 并行下，而不是 1 MB 加一个 100 KB 的尾巴。
-- 播放器一个请求大约 2 秒收不到字节就会放弃重发，fanout 要整段下完才回，超过这个时间那份就白下了（日志里对应 Surge 主日志的 `Stream was already closed`）。所以脚本记着最近 fanout 的整体速度（10 分钟内有效，至少要有 3 次 fanout 才生效，因为隔了一阵之后头几次要重新建连接，测出来偏慢），预计 1.5 秒内下不完的 Range 直接 swap，让数据边下边给，脚本日志里是 `swapped NKB: fanout at …KB/s would take …ms`。没有近期速度时只看 `MaxMB`。
-- 太小（不到两块）、太大（超过 `MaxMB`）或开放的 Range（`bytes=a-`）默认只 swap。`OpenRange=clip` 时开放 Range 会先取一块拿到文件大小，再返回 `Threads × ChunkKB × 2` 字节的 206（有近期速度时不超过 1.5 秒能下完的量）。这依赖播放器自己续读剩下的部分，属于实验功能。
+- 有的播放器（B 站官方 App）一个请求大约 2 秒收不到字节就会放弃重发，fanout 要整段下完才回，超过这个时间那份就白下了（日志里对应 Surge 主日志的 `Stream was already closed`）。所以脚本记着最近 fanout 的整体速度（10 分钟内有效，至少要有 3 次 fanout 才生效，因为隔了一阵之后头几次要重新建连接，测出来偏慢），对这种客户端，预计 1.5 秒内下不完的 Range 直接 swap，让数据边下边给，脚本日志里是 `swapped NKB: fanout at …KB/s would take …ms`。
+- 另一些播放器（Apple TV 上基于 AVPlayer 的客户端，比如 miao）会一直等到整段下完，对它们来说单节点 swap 远比晚一点返回的 fanout 慢。客户端按 User-Agent 区分：某个 Range 的 fanout 还没返回、同一个客户端又请求了同一个 Range，就记为"会放弃"（日志 `client … gives up on slow replies`，记录保存 30 天，存在 `bili-ripper.clients`），之后才对它套用 1.5 秒的规则。没被记过的客户端放宽到 15 秒，只有按速度 15 秒都下不完的 Range 才 swap（日志带 `(patient client)`），免得 fanout 撞上脚本自己的 25 秒上限后白下。代价是每个会放弃的客户端第一次碰到慢 fanout 时会被取消一次。
+- 太小（不到两块）、太大（超过 `MaxMB`）或开放的 Range（`bytes=a-`）默认只 swap。`OpenRange=clip` 时开放 Range 会先取一块拿到文件大小，再返回 `Threads × ChunkKB × 2` 字节的 206（有近期速度时不超过客户端目标时间内能下完的量）。这依赖播放器自己续读剩下的部分，属于实验功能。
 - P2P/PCDN 中转（`mcdn.bilivideo.cn/com/net`、`szbdyd.com`、`xycdn.com`、`mountaintoys.cn`、`nexusedgeio.com`、`ahdohpiechei.com`，与上游一致）默认 REJECT，逼客户端用 upos 备用地址。QUIC 也会被拒，让客户端走 TCP，这样才能被 MITM。
 
 ## 安装
@@ -39,7 +40,7 @@
 | `PerNode` | `3` | 同一节点同时几个请求 |
 | `ChunkKB` | `1024` | 每块最大大小 |
 | `OpenRange` | `swap` | `swap` 或 `clip` |
-| `MaxMB` | `16` | 超过这个大小的 Range 只 swap（按速度预计超过 1.5 秒的也会 swap） |
+| `MaxMB` | `16` | 超过这个大小的 Range 只 swap（按速度预计超过 1.5 秒、耐心客户端 15 秒的也会 swap） |
 | `PCDN` | `REJECT` | 改成 `DIRECT` 就放行 PCDN |
 
 默认 8 线程配 `PerNode=3`：海外看的时候往往只有两三个节点真正快，`PerNode=1` 会强制把线程摊到慢节点上，每个 Range 都要等最慢那块；`PerNode=3` 让 8 条流基本都落在最快的几个节点上。实测（英国，`Nodes=all`）单个好节点约 1.8 MB/s，fanout 平均 4 到 6 MB/s。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `several videos refused`，就把 `Threads` 调回 4。
