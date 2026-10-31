@@ -56,20 +56,26 @@ const FANOUT_SPEED_TTL_MS = 10 * 60 * 1000;
 const FANOUT_MIN_SAMPLES = 3;
 // Only some players give up early: AVPlayer-based clients (Apple TV) wait for the whole reply,
 // and for them a swap to one slow node is worse than a fanout that answers late. A client is
-// known by its User-Agent and counts as impatient once it asks for a Range again while the
-// fanout for that Range has been running for GIVE_UP_MIN_MS; only then does FANOUT_TARGET_MS
-// apply to it. Some clients (miao) send the same Range twice within a few milliseconds, which
-// is not giving up, so a repeat sooner than that does not count. A
-// patient client gets PATIENT_TARGET_MS, so a fanout too slow to finish within the script's
-// FANOUT_BUDGET_MS is swapped up front instead of thrown away at the end. The
-// record lives under its own key and is read and written in one step, so the fanout that is
-// still running cannot overwrite it when it saves its state.
+// known by its User-Agent. A request for a Range whose fanout has run for GIVE_UP_MIN_MS
+// without answering counts as giving up; a fanout slower than FANOUT_TARGET_MS that answered
+// without such a repeat counts as waited. Every client cancels now and then (a seek drops
+// all running requests), so a client is impatient only once it gave up at least
+// IMPATIENT_MIN_GIVE_UPS times and at least as often as it waited; only then does
+// FANOUT_TARGET_MS apply to it. Some clients (miao) send the same Range twice within a few
+// milliseconds, which is why a repeat sooner than GIVE_UP_MIN_MS does not count. Others get
+// PATIENT_TARGET_MS, so a fanout too slow to finish within the script's FANOUT_BUDGET_MS is
+// swapped up front instead of thrown away at the end. Counts are halved once they pass
+// CLIENT_MAX_COUNT, so a client that changes its ways is judged again. The record lives
+// under its own key and is read and written in one step, so the fanout that is still running
+// cannot overwrite it when it saves its state.
 const PATIENT_TARGET_MS = 15 * 1000;
 const GIVE_UP_MIN_MS = 1000;
+const IMPATIENT_MIN_GIVE_UPS = 3;
+const CLIENT_MAX_COUNT = 40;
 const CLIENTS_KEY = "bili-ripper.clients";
-// Raised whenever the rule for marking a client changes, so marks made under the old rule go.
-const CLIENTS_VERSION = 2;
-const IMPATIENT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+// Raised whenever the rule for judging a client changes, so counts made under the old rule go.
+const CLIENTS_VERSION = 3;
+const CLIENT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const MAX_CLIENTS = 16;
 const MAX_RUNNING = 32;
 // A Range is split into equal chunks, no larger than ChunkKB, and into up to Threads of them
@@ -228,11 +234,11 @@ function loadClients(now) {
   if (!clients || typeof clients !== "object" || clients.v !== CLIENTS_VERSION) clients = { v: CLIENTS_VERSION };
   const running = Array.isArray(clients.running) ? clients.running : [];
   clients.running = running.filter((entry) => now - entry.at < FANOUT_BUDGET_MS).slice(-MAX_RUNNING);
-  const impatient = clients.impatient && typeof clients.impatient === "object" ? clients.impatient : {};
-  clients.impatient = {};
-  Object.keys(impatient).filter((agent) => now - impatient[agent] < IMPATIENT_TTL_MS)
-    .sort((a, b) => impatient[b] - impatient[a]).slice(0, MAX_CLIENTS)
-    .forEach((agent) => { clients.impatient[agent] = impatient[agent]; });
+  const stats = clients.stats && typeof clients.stats === "object" ? clients.stats : {};
+  clients.stats = {};
+  Object.keys(stats).filter((agent) => now - stats[agent].at < CLIENT_TTL_MS)
+    .sort((a, b) => stats[b].at - stats[a].at).slice(0, MAX_CLIENTS)
+    .forEach((agent) => { clients.stats[agent] = stats[agent]; });
   return clients;
 }
 
@@ -244,18 +250,42 @@ function agentOf(headers) {
   return hashOf(String(header(headers, "user-agent") || "")).toString(36);
 }
 
-// Notes a request, marking its client impatient when the same Range has been fanned out for
-// it for a while and is still running. Returns whether the client is impatient.
+function isImpatient(clients, agent) {
+  const stats = clients.stats[agent];
+  return !!stats && stats.gaveUp >= IMPATIENT_MIN_GIVE_UPS && stats.gaveUp >= stats.waited;
+}
+
+// Adds one give-up or one wait to a client's counts, logging when its verdict changes.
+function countClient(clients, agent, gaveUp, now) {
+  const before = isImpatient(clients, agent);
+  const stats = clients.stats[agent] || (clients.stats[agent] = { gaveUp: 0, waited: 0, at: 0 });
+  if (gaveUp) stats.gaveUp += 1;
+  else stats.waited += 1;
+  if (stats.gaveUp + stats.waited > CLIENT_MAX_COUNT) {
+    stats.gaveUp = Math.floor(stats.gaveUp / 2);
+    stats.waited = Math.floor(stats.waited / 2);
+  }
+  stats.at = now;
+  const after = isImpatient(clients, agent);
+  if (after !== before) {
+    console.log("[bili-ripper] client " + agent + (after ? " gives up on slow replies" : " waits for slow replies")
+      + " (gave up " + stats.gaveUp + ", waited " + stats.waited + "): fanouts for it now stay within "
+      + (after ? FANOUT_TARGET_MS : PATIENT_TARGET_MS) + "ms");
+  }
+}
+
+// Notes a request, counting a give-up when the same Range has been fanned out for its client
+// for a while and is still running. Returns whether the client is impatient.
 function noteClient(agent, key, now) {
   const clients = loadClients(now);
-  const repeat = clients.running.some((entry) => entry.key === key && entry.agent === agent
-    && now - entry.at >= GIVE_UP_MIN_MS);
-  if (repeat) {
-    if (!clients.impatient[agent]) console.log("[bili-ripper] client " + agent + " gives up on slow replies: fanouts for it now stay within " + FANOUT_TARGET_MS + "ms");
-    clients.impatient[agent] = now;
+  const abandoned = clients.running.filter((entry) => entry.key === key && entry.agent === agent
+    && !entry.abandoned && now - entry.at >= GIVE_UP_MIN_MS);
+  if (abandoned.length) {
+    abandoned.forEach((entry) => { entry.abandoned = true; });
+    countClient(clients, agent, true, now);
     saveClients(clients);
   }
-  return !!clients.impatient[agent];
+  return isImpatient(clients, agent);
 }
 
 function beginFanout(agent, key, now) {
@@ -266,8 +296,14 @@ function beginFanout(agent, key, now) {
   return entry;
 }
 
-function endFanout(entry) {
-  const clients = loadClients(Date.now());
+// Ends a fanout; one that answered after FANOUT_TARGET_MS with nobody asking again counts as waited.
+function endFanout(entry, answered) {
+  const now = Date.now();
+  const clients = loadClients(now);
+  const current = clients.running.filter((item) => item.id === entry.id)[0];
+  if (answered && current && !current.abandoned && now - current.at > FANOUT_TARGET_MS) {
+    countClient(clients, entry.agent, false, now);
+  }
   clients.running = clients.running.filter((item) => item.id !== entry.id);
   saveClients(clients);
 }
@@ -752,12 +788,12 @@ function onRequest() {
   });
   const running = beginFanout(agent, key, now);
   Promise.race([fanout($request, url, config, state, range, impatient), budget]).then((response) => {
-    endFanout(running);
+    endFanout(running, true);
     state.refusals = 0;
     saveState(state);
     $done({ response });
   }, (error) => {
-    endFanout(running);
+    endFanout(running, false);
     const where = error && error.original ? "the original host" : "swap";
     console.log("[bili-ripper] fanout fell back to " + where + ": " + (error && error.message));
     if (error && error.original) original();

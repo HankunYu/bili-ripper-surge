@@ -37,10 +37,33 @@ function clients(store) {
   return JSON.parse(store.read("bili-ripper.clients") || "null");
 }
 
-// Marks the test User-Agent as a client that gives up on slow replies.
-function markImpatient(store, userAgent = "Mozilla/5.0 Chrome/130") {
+// Seeds the test User-Agent's counts; the defaults make it a client that gives up on slow replies.
+function seedClient(store, gaveUp = 3, waited = 0, userAgent = "Mozilla/5.0 Chrome/130") {
   const agent = fn.agentOf({ "User-Agent": userAgent });
-  store.write(JSON.stringify({ v: 2, running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
+  store.write(JSON.stringify({ v: 3, running: [], stats: { [agent]: { gaveUp, waited, at: Date.now() } } }), "bili-ripper.clients");
+  return agent;
+}
+
+const markImpatient = (store) => seedClient(store);
+
+// Starts a fanout whose chunk replies are held back until release() is called.
+async function heldFanout(store, range) {
+  const cdn = createCdn(16 * MB);
+  const held = [];
+  const done = runHook({ request: mediaRequest(range), store, http: (options, callback) => held.push([options, callback]) });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(held.length > 0);
+  // Pretends the fanout started this long ago.
+  const age = (ms) => {
+    const record = clients(store);
+    record.running.forEach((entry) => { entry.at -= ms; });
+    store.write(JSON.stringify(record), "bili-ripper.clients");
+  };
+  const release = () => {
+    held.forEach(([options, callback]) => cdn.get(options, callback));
+    return done;
+  };
+  return { age, release };
 }
 
 test("config falls back to defaults and clamps values", () => {
@@ -506,64 +529,80 @@ test("a patient client fans out Ranges too slow for 1.5 s, but not ones too slow
   assert.ok(swapped.url);
 });
 
-test("a client that asks for a Range again while its fanout runs counts as impatient", async () => {
+test("a client that gives up on running fanouts as often as it waits counts as impatient", async () => {
   const store = createStore();
   store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
-  const cdn = createCdn(16 * MB);
-  // Chunk replies are held back, so the first fanout is still running.
-  const held = [];
-  const first = runHook({ request: mediaRequest("bytes=0-4194303"), store, http: (options, callback) => held.push([options, callback]) });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.ok(held.length > 0);
-  assert.equal(clients(store).running.length, 1);
-  // The fanout has been running long enough for the repeat to mean the player gave up.
-  const record = clients(store);
-  record.running[0].at -= 1500;
-  store.write(JSON.stringify(record), "bili-ripper.clients");
-
-  // The player gave up and asks again: 4 MB at 2 MB/s is too slow for it now.
-  const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  const agent = seedClient(store, 2, 1);
+  const first = await heldFanout(store, "bytes=0-4194303");
+  // The fanout has run long enough for a repeat to mean the player gave up.
+  first.age(1500);
+  // A third give-up against one wait: 4 MB at 2 MB/s is too slow for this client now.
+  const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: createCdn(16 * MB).get });
   assert.ok(again.url);
-  const agent = fn.agentOf({ "User-Agent": "Mozilla/5.0 Chrome/130" });
-  assert.ok(clients(store).impatient[agent] > 0);
+  assert.deepEqual(plain(clients(store).stats[agent]).gaveUp, 3);
 
   // Another client is not affected.
   const other = await runHook({
     request: mediaRequest("bytes=0-4194303", { headers: Object.assign(mediaRequest().headers, { "User-Agent": "AppleCoreMedia/1.0", Range: "bytes=0-4194303" }) }),
-    store, http: cdn.get
+    store, http: createCdn(16 * MB).get
   });
   assert.equal(other.response.status, 206);
 
-  held.forEach(([options, callback]) => cdn.get(options, callback));
-  const done = await first;
+  const done = await first.release();
   assert.equal(done.response.status, 206);
-  // The finished fanout saved its state without losing the mark.
-  assert.ok(clients(store).impatient[agent] > 0);
-  assert.deepEqual(clients(store).running.filter((entry) => entry.agent === agent), []);
+  // The abandoned fanout does not count as waited, and saving its state kept the counts.
+  assert.equal(clients(store).stats[agent].gaveUp, 3);
+  assert.equal(clients(store).stats[agent].waited, 1);
+  assert.deepEqual(clients(store).running, []);
 });
 
-test("the same Range sent twice at once does not mark the client impatient", async () => {
+test("a slow fanout answered without a repeat counts as waited", async () => {
+  const store = createStore();
+  const agent = seedClient(store, 0, 0);
+  const run = await heldFanout(store, "bytes=0-4194303");
+  run.age(2000);
+  await run.release();
+  assert.equal(clients(store).stats[agent].waited, 1);
+  // A fast one says nothing about patience.
+  await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: createCdn(16 * MB).get });
+  assert.equal(clients(store).stats[agent].waited, 1);
+});
+
+test("occasional give-ups among many waits keep a client patient", () => {
+  const record = { stats: {} };
+  for (let i = 0; i < 20; i++) fn.countClient(record, "tv", false, Date.now());
+  for (let i = 0; i < 4; i++) fn.countClient(record, "tv", true, Date.now());
+  assert.equal(fn.isImpatient(record, "tv"), false);
+  // A client that mostly gives up is impatient once it did so three times.
+  fn.countClient(record, "phone", true, Date.now());
+  fn.countClient(record, "phone", true, Date.now());
+  assert.equal(fn.isImpatient(record, "phone"), false);
+  fn.countClient(record, "phone", true, Date.now());
+  assert.equal(fn.isImpatient(record, "phone"), true);
+  // Counts are halved past 40, so old behaviour fades.
+  for (let i = 0; i < 40; i++) fn.countClient(record, "tv", false, Date.now());
+  assert.ok(record.stats.tv.gaveUp + record.stats.tv.waited <= 40);
+});
+
+test("the same Range sent twice at once is not a give-up", async () => {
   const store = createStore();
   store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
-  const cdn = createCdn(16 * MB);
-  const held = [];
-  const first = runHook({ request: mediaRequest("bytes=0-4194303"), store, http: (options, callback) => held.push([options, callback]) });
-  await new Promise((resolve) => setImmediate(resolve));
+  const agent = seedClient(store, 2, 0);
+  const first = await heldFanout(store, "bytes=0-4194303");
   // A duplicate right behind the first one is fanned out like any other request.
-  const twin = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  const twin = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: createCdn(16 * MB).get });
   assert.equal(twin.response.status, 206);
-  assert.deepEqual(clients(store).impatient, {});
-  held.forEach(([options, callback]) => cdn.get(options, callback));
-  await first;
+  assert.equal(clients(store).stats[agent].gaveUp, 2);
+  await first.release();
 });
 
-test("marks made under an older rule are dropped", async () => {
+test("counts made under an older rule are dropped", async () => {
   const store = createStore();
   const agent = fn.agentOf({ "User-Agent": "Mozilla/5.0 Chrome/130" });
-  store.write(JSON.stringify({ running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
+  store.write(JSON.stringify({ v: 2, running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
   store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
   const result = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: createCdn(16 * MB).get });
   assert.equal(result.response.status, 206);
-  assert.equal(clients(store).v, 2);
-  assert.deepEqual(clients(store).impatient, {});
+  assert.equal(clients(store).v, 3);
+  assert.equal(clients(store).impatient, undefined);
 });
