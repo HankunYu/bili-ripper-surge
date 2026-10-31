@@ -40,7 +40,7 @@ function clients(store) {
 // Marks the test User-Agent as a client that gives up on slow replies.
 function markImpatient(store, userAgent = "Mozilla/5.0 Chrome/130") {
   const agent = fn.agentOf({ "User-Agent": userAgent });
-  store.write(JSON.stringify({ running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
+  store.write(JSON.stringify({ v: 2, running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
 }
 
 test("config falls back to defaults and clamps values", () => {
@@ -516,6 +516,10 @@ test("a client that asks for a Range again while its fanout runs counts as impat
   await new Promise((resolve) => setImmediate(resolve));
   assert.ok(held.length > 0);
   assert.equal(clients(store).running.length, 1);
+  // The fanout has been running long enough for the repeat to mean the player gave up.
+  const record = clients(store);
+  record.running[0].at -= 1500;
+  store.write(JSON.stringify(record), "bili-ripper.clients");
 
   // The player gave up and asks again: 4 MB at 2 MB/s is too slow for it now.
   const again = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
@@ -536,4 +540,30 @@ test("a client that asks for a Range again while its fanout runs counts as impat
   // The finished fanout saved its state without losing the mark.
   assert.ok(clients(store).impatient[agent] > 0);
   assert.deepEqual(clients(store).running.filter((entry) => entry.agent === agent), []);
+});
+
+test("the same Range sent twice at once does not mark the client impatient", async () => {
+  const store = createStore();
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
+  const cdn = createCdn(16 * MB);
+  const held = [];
+  const first = runHook({ request: mediaRequest("bytes=0-4194303"), store, http: (options, callback) => held.push([options, callback]) });
+  await new Promise((resolve) => setImmediate(resolve));
+  // A duplicate right behind the first one is fanned out like any other request.
+  const twin = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: cdn.get });
+  assert.equal(twin.response.status, 206);
+  assert.deepEqual(clients(store).impatient, {});
+  held.forEach(([options, callback]) => cdn.get(options, callback));
+  await first;
+});
+
+test("marks made under an older rule are dropped", async () => {
+  const store = createStore();
+  const agent = fn.agentOf({ "User-Agent": "Mozilla/5.0 Chrome/130" });
+  store.write(JSON.stringify({ running: [], impatient: { [agent]: Date.now() } }), "bili-ripper.clients");
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {}, fanoutBps: 2 * MB, fanoutSamples: 3, fanoutAt: Date.now() }), "bili-ripper.state");
+  const result = await runHook({ request: mediaRequest("bytes=0-4194303"), store, http: createCdn(16 * MB).get });
+  assert.equal(result.response.status, 206);
+  assert.equal(clients(store).v, 2);
+  assert.deepEqual(clients(store).impatient, {});
 });
