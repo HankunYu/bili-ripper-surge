@@ -630,13 +630,13 @@ test("a hedge that lags as well gets another copy", async () => {
 test("a hedge that finds every hedge slot taken is tried again once one frees up", async () => {
   const cdn = createCdn(2 * MB);
   const copies = {};
-  // The first copy of chunks 0-2 hangs; hedges answer after a second, so only two run at once.
+  // The first copy of chunks 0-2 hangs; hedges answer after 600 ms, so only two run at once.
   const http = (options, callback) => {
     const start = Number(/^bytes=(\d+)-/.exec(options.headers.Range)[1]);
     copies[start] = (copies[start] || 0) + 1;
     if (copies[start] === 1 && start < 3 * 512 * KB) return;
     if (copies[start] === 1) return cdn.get(options, callback);
-    setTimeout(() => cdn.get(options, callback), 1000).unref();
+    setTimeout(() => cdn.get(options, callback), 600).unref();
   };
   const began = Date.now();
   const result = await runHook({
@@ -648,4 +648,27 @@ test("a hedge that finds every hedge slot taken is tried again once one frees up
   assert.match(result.response.headers["X-Bili-Ripper"], /hedged=3$/);
   // Without the retry the third chunk would wait for the 15 s chunk timeout.
   assert.ok(Date.now() - began < 6000);
+});
+
+test("regular chunks skip nodes far slower than the fastest; hedges may still use them", () => {
+  const now = Date.now();
+  const nodes = {};
+  const speeds = { a: 1800, b: 1400, c: 400, d: 200 };
+  const hosts = Object.keys(speeds).map((name) => "upos-sz-mirror" + name + ".bilivideo.com");
+  hosts.forEach((host, i) => { nodes[host] = { bps: speeds["abcd"[i]] * KB, at: now, fail: 0, until: 0 }; });
+  const job = {
+    config: plain(fn.parseConfig("nodes=" + hosts.join("|") + "&per_node=3")),
+    state: { nodes, refused: {} }, path: PATH, inflight: {}, probe: null
+  };
+  const chunk = () => ({ tried: [] });
+  // Eight chunks: the two fast nodes take every one, beyond their three slots each.
+  const picked = [];
+  for (let i = 0; i < 8; i++) {
+    const host = fn.pickChunkNode(job, chunk(), false);
+    job.inflight[host] = (job.inflight[host] || 0) + 1;
+    picked.push(host);
+  }
+  assert.ok(picked.every((host) => host === hosts[0] || host === hosts[1]));
+  // A hedge looks for a free node and may land on a slow one.
+  assert.equal(fn.pickChunkNode(job, chunk(), true), hosts[2]);
 });

@@ -40,7 +40,9 @@ const CHUNK_TIMEOUT_S = 15;
 // delay applies. At most this many extra copies run at once. The lagging node is not blamed,
 // its speed estimate just drops to what it has shown so far, so it sinks in the ranking.
 const HEDGE_FACTOR = 2;
-const HEDGE_MIN_MS = 1500;
+// miao (AVPlayer) drops a Range that sends nothing for about 2.3 s, so a lagging chunk has
+// to be fetched again well before that.
+const HEDGE_MIN_MS = 1000;
 const HEDGE_FIRST_MS = 5000;
 const HEDGE_MAX_INFLIGHT = 2;
 // A chunk keeps being watched until it arrives: when a hedge is due but the job has no hedge
@@ -88,6 +90,11 @@ const MAX_RUNNING = 32;
 // A Range is split into equal chunks, no larger than ChunkKB, and into up to Threads of them
 // while each stays at least this big: 1.1 MB becomes four even chunks, not 1 MB plus a tail.
 const MIN_CHUNK_BYTES = 256 * 1024;
+// A node whose streams run slower than this share of the fastest node's gets no regular
+// chunks: with Threads above the fast nodes' PerNode slots, the last chunks used to land on
+// it and every Range waited for a hedge. Fast nodes take an extra stream instead. Slow nodes
+// still serve hedges and the probe, so their speed is measured again.
+const SLOW_NODE_RATIO = 1 / 3;
 // Swap mode spreads files over this many of the best nodes.
 const SWAP_SPREAD = 3;
 
@@ -520,6 +527,7 @@ function isFresh(state, host, now) {
 // Fastest expected stream first: a fast node's second slot beats a slow node's first.
 // Nodes without a recent measurement are probed one per Range with a single chunk, the
 // longest unmeasured first. Only when nothing has a recent measurement do they all run.
+// A regular chunk skips slow nodes (SLOW_NODE_RATIO); a hedge (freeOnly) may use them.
 function pickChunkNode(job, chunk, freeOnly) {
   const now = Date.now();
   const refused = job.state.refused[dirOf(job.path)];
@@ -534,6 +542,12 @@ function pickChunkNode(job, chunk, freeOnly) {
       }
     }
     pool = ranked.filter((host) => host === job.probe || isFresh(job.state, host, now));
+    if (!freeOnly) {
+      const bps = (host) => job.state.nodes[host].bps;
+      const fastest = Math.max.apply(null, pool.filter((host) => isFresh(job.state, host, now)).map(bps));
+      const quick = pool.filter((host) => host === job.probe || bps(host) >= fastest * SLOW_NODE_RATIO);
+      if (quick.some((host) => host !== job.probe)) pool = quick;
+    }
   }
   const limit = (host) => (host === job.probe ? 1 : job.config.perNode);
   const free = pool.filter((host) => load(host) < limit(host));
