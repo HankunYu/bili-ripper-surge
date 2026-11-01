@@ -150,7 +150,7 @@ function parseConfig(argument) {
     perNode: clampInt(raw.per_node, 1, 8, 3),
     chunkBytes: clampInt(raw.chunk_kb, 128, 8192, 1024) * 1024,
     openRange: raw.open_range === "clip" ? "clip" : "swap",
-    maxBytes: clampInt(raw.max_mb, 1, 64, 16) * 1024 * 1024
+    maxBytes: clampInt(raw.max_mb, 1, 64, 32) * 1024 * 1024
   };
 }
 
@@ -771,7 +771,11 @@ function fanoutEligible(request, config, state, range, now, impatient) {
   if (!range || state.cooldown > now) return false;
   if (range.end === null) return config.openRange === "clip";
   const length = range.end - range.start + 1;
-  if (length <= config.chunkBytes || length > config.maxBytes) return false;
+  if (length <= config.chunkBytes) return false;
+  if (length > config.maxBytes) {
+    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: over MaxMB " + config.maxBytes / 1048576);
+    return false;
+  }
   if (length <= budgetBytes(state, now, impatient)) return true;
   console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB" + (impatient ? "" : " (patient client)") + ": fanout at "
     + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");

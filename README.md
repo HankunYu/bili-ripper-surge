@@ -40,7 +40,7 @@
 | `PerNode` | `3` | 同一节点同时几个请求 |
 | `ChunkKB` | `1024` | 每块最大大小 |
 | `OpenRange` | `swap` | `swap` 或 `clip` |
-| `MaxMB` | `16` | 超过这个大小的 Range 只 swap（按速度预计超过 1.5 秒、耐心客户端 15 秒的也会 swap） |
+| `MaxMB` | `32` | 超过这个大小的 Range 只 swap，日志 `swapped NKB: over MaxMB M`（按速度预计超过 1.5 秒、耐心客户端 15 秒的也会 swap）。Apple TV 上的 4K 流一段常有 15–20 MB，16 会把大段推给单节点 |
 | `PCDN` | `REJECT` | 改成 `DIRECT` 就放行 PCDN |
 
 默认 8 线程配 `PerNode=3`：海外看的时候往往只有两三个节点真正快，`PerNode=1` 会强制把线程摊到慢节点上，每个 Range 都要等最慢那块；`PerNode=3` 让 8 条流基本都落在最快的几个节点上。实测（英国，`Nodes=all`）单个好节点约 1.8 MB/s，fanout 平均 4 到 6 MB/s。B 站 CDN 有防盗链，一个 IP 短时间请求太多会被所有节点 403 大约一分钟；如果脚本日志里经常出现 `several videos refused`，就把 `Threads` 调回 4。

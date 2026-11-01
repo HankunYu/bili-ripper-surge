@@ -75,6 +75,7 @@ test("config falls back to defaults and clamps values", () => {
   assert.equal(config.maxBytes, 8 * MB);
   assert.equal(config.openRange, "swap");
   assert.deepEqual(plain(config.nodes), MAINLAND);
+  assert.equal(fn.parseConfig("").maxBytes, 32 * MB);
   assert.equal(fn.parseConfig("mode=swap&open_range=clip").mode, "swap");
   assert.equal(fn.parseConfig("").threads, 8);
   assert.equal(fn.parseConfig("").perNode, 3);
