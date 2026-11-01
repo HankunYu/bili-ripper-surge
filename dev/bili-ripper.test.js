@@ -606,3 +606,46 @@ test("counts made under an older rule are dropped", async () => {
   assert.equal(clients(store).v, 3);
   assert.equal(clients(store).impatient, undefined);
 });
+
+test("a hedge that lags as well gets another copy", async () => {
+  const seen = {};
+  // The first two copies of the first chunk hang; everything else answers at once.
+  const cdn = createCdn(2 * MB, (host, start) => {
+    seen[start] = (seen[start] || 0) + 1;
+    return start === 0 && seen[start] <= 2 ? "hang" : "ok";
+  });
+  const began = Date.now();
+  const result = await runHook({
+    request: mediaRequest("bytes=0-2097151"), argument: "threads=4&per_node=1&chunk_kb=512", store: createStore(), http: cdn.get
+  });
+  assert.equal(result.response.status, 206);
+  assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 2097152)));
+  const copies = cdn.calls.filter((call) => call.start === 0);
+  assert.equal(copies.length, 3);
+  assert.equal(new Set(copies.map((call) => call.host)).size, 3);
+  assert.match(result.response.headers["X-Bili-Ripper"], /hedged=2$/);
+  assert.ok(Date.now() - began < 6000);
+});
+
+test("a hedge that finds every hedge slot taken is tried again once one frees up", async () => {
+  const cdn = createCdn(2 * MB);
+  const copies = {};
+  // The first copy of chunks 0-2 hangs; hedges answer after a second, so only two run at once.
+  const http = (options, callback) => {
+    const start = Number(/^bytes=(\d+)-/.exec(options.headers.Range)[1]);
+    copies[start] = (copies[start] || 0) + 1;
+    if (copies[start] === 1 && start < 3 * 512 * KB) return;
+    if (copies[start] === 1) return cdn.get(options, callback);
+    setTimeout(() => cdn.get(options, callback), 1000).unref();
+  };
+  const began = Date.now();
+  const result = await runHook({
+    request: mediaRequest("bytes=0-2097151"),
+    argument: "threads=4&per_node=1&chunk_kb=512&nodes=all", store: createStore(), http
+  });
+  assert.equal(result.response.status, 206);
+  assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 2097152)));
+  assert.match(result.response.headers["X-Bili-Ripper"], /hedged=3$/);
+  // Without the retry the third chunk would wait for the 15 s chunk timeout.
+  assert.ok(Date.now() - began < 6000);
+});

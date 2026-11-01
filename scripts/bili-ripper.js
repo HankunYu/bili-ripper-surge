@@ -43,6 +43,13 @@ const HEDGE_FACTOR = 2;
 const HEDGE_MIN_MS = 1500;
 const HEDGE_FIRST_MS = 5000;
 const HEDGE_MAX_INFLIGHT = 2;
+// A chunk keeps being watched until it arrives: when a hedge is due but the job has no hedge
+// slot or no free node, it is tried again after HEDGE_RETRY_MS, and a hedge that lags in turn
+// gets another copy, up to HEDGE_MAX_COPIES running at once for one chunk.
+const HEDGE_RETRY_MS = 500;
+const HEDGE_MAX_COPIES = 3;
+// A fanout slower than this logs its slowest chunk, with every copy's node and time.
+const SLOW_FANOUT_LOG_MS = 4000;
 const FANOUT_BUDGET_MS = 25 * 1000;
 // A fanout replies only once the whole Range is in, and players give up on a request that
 // sends nothing for about two seconds, then ask again: the first download is thrown away.
@@ -561,25 +568,35 @@ function hedgeDelay(job) {
   return Math.max(HEDGE_MIN_MS, Math.round(average * HEDGE_FACTOR));
 }
 
-// Fetches one chunk, starting a second copy elsewhere if the first one lags behind the others.
-// Resolves with the first good reply, or with the last failure once every copy has failed.
-// A copy that is still running when another one wins is left to finish on its own.
+// Fetches one chunk, starting another copy elsewhere whenever the newest one lags behind the
+// others. Resolves with the first good reply, or with the last failure once every copy has
+// failed. A copy that is still running when another one wins is left to finish on its own.
 function fetchChunkRaced(job, chunk) {
   return new Promise((resolve) => {
-    let pending = 0;
     let settled = false;
+    let lastLaunch = 0;
+    const copies = chunk.copies = [];
+    const running = () => copies.filter((copy) => copy.ms === undefined);
+    const settle = (result) => {
+      settled = true;
+      chunk.firstAt = copies[0].began;
+      chunk.doneAt = Date.now();
+      resolve(result);
+    };
     const launch = (host, hedge) => {
-      pending += 1;
+      const copy = { host, began: Date.now() };
+      copies.push(copy);
+      lastLaunch = copy.began;
       chunk.tried.push(host);
       job.inflight[host] = (job.inflight[host] || 0) + 1;
       if (hedge) job.hedges += 1;
-      const began = Date.now();
-      chunk.began[host] = began;
+      chunk.began[host] = copy.began;
       fetchChunk(job, host, chunk).then((result) => {
         job.inflight[host] -= 1;
         if (hedge) job.hedges -= 1;
-        pending -= 1;
         const now = Date.now();
+        copy.ms = now - copy.began;
+        copy.result = result.ok ? "ok" : result.status ? "HTTP " + result.status : "no reply";
         result.host = host;
         if (result.ok) {
           recordNode(job.state, host, true, result.bps, now);
@@ -599,34 +616,49 @@ function fetchChunkRaced(job, chunk) {
         }
         if (settled) return;
         if (result.ok) {
-          settled = true;
-          job.durations.push(now - began);
-          resolve(result);
-        } else if (pending === 0) {
-          settled = true;
-          resolve(result);
+          job.durations.push(copy.ms);
+          settle(result);
+        } else if (!running().length) {
+          settle(result);
         }
       });
-      // The delay depends on chunks that finish later, so it is re-read until it is due.
-      const check = () => {
-        if (settled) return;
-        const due = began + hedgeDelay(job);
-        const now = Date.now();
-        if (now >= due) maybeHedge(host);
-        else setTimeout(check, Math.min(due - now, HEDGE_MIN_MS));
-      };
-      if (!hedge) setTimeout(check, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
     };
-    const maybeHedge = (slowHost) => {
-      if (settled || job.aborted || job.hedges >= HEDGE_MAX_INFLIGHT) return;
-      const host = pickChunkNode(job, chunk, true);
-      if (!host) return;
-      slowDown(job, slowHost, chunk);
-      job.hedged += 1;
-      launch(host, true);
+    // One watcher per chunk. The delay depends on chunks that finish later, so it is re-read
+    // until it is due; a hedge that cannot start yet is tried again shortly after.
+    const watch = () => {
+      if (settled || job.aborted) return;
+      const now = Date.now();
+      const due = lastLaunch + hedgeDelay(job);
+      if (now < due) {
+        setTimeout(watch, Math.min(due - now, HEDGE_MIN_MS));
+        return;
+      }
+      if (running().length < HEDGE_MAX_COPIES && job.hedges < HEDGE_MAX_INFLIGHT) {
+        const host = pickChunkNode(job, chunk, true);
+        if (host) {
+          running().forEach((copy) => slowDown(job, copy.host, chunk));
+          job.hedged += 1;
+          launch(host, true);
+          setTimeout(watch, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
+          return;
+        }
+      }
+      setTimeout(watch, HEDGE_RETRY_MS);
     };
     launch(pickChunkNode(job, chunk, false), false);
+    setTimeout(watch, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
   });
+}
+
+// Names the chunk that took longest, with the node, time and outcome of each of its copies.
+function describeSlowest(job) {
+  const slowest = job.done.slice().sort((a, b) => (b.doneAt - b.firstAt) - (a.doneAt - a.firstAt))[0];
+  if (!slowest) return "";
+  const copies = slowest.copies.map((copy) => copy.host.replace(".bilivideo.com", "") + " "
+    + (copy.ms === undefined ? "still running at " + (slowest.doneAt - copy.began) + "ms" : copy.result + " in " + copy.ms + "ms")
+    + " (from +" + (copy.began - slowest.firstAt) + "ms)");
+  return "slowest chunk " + slowest.start + "-" + slowest.end + " took " + (slowest.doneAt - slowest.firstAt)
+    + "ms: " + copies.join(", ");
 }
 
 // An abort marked original sends the request to the host Bilibili named instead of a swap.
@@ -715,7 +747,8 @@ async function fanout(request, url, config, state, range, impatient) {
   const ms = Date.now() - job.startedAt;
   recordFanout(state, body.length, ms, Date.now());
   console.log("[bili-ripper] fanout " + Math.round(body.length / 1024) + "KB in " + ms + "ms ("
-    + Math.round(body.length / 1.024 / Math.max(ms, 1)) + "KB/s) " + headers["X-Bili-Ripper"].slice(7));
+    + Math.round(body.length / 1.024 / Math.max(ms, 1)) + "KB/s) " + headers["X-Bili-Ripper"].slice(7)
+    + (ms > SLOW_FANOUT_LOG_MS ? "; " + describeSlowest(job) : ""));
   return { status: 206, headers, body };
 }
 
