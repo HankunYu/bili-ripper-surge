@@ -673,3 +673,57 @@ test("regular chunks skip nodes far slower than the fastest; hedges may still us
   // A hedge looks for a free node and may land on a slow one.
   assert.equal(fn.pickChunkNode(job, chunk(), true), hosts[2]);
 });
+
+test("before any chunk finishes, a hedge is due by the node's measured speed", () => {
+  const host = MAINLAND[0];
+  const job = (bps) => ({ durations: [], state: { nodes: bps ? { [host]: { bps, at: Date.now() } } : {} } });
+  const chunk = (bytes) => ({ start: 0, end: bytes - 1, copies: [{ host, began: Date.now() }] });
+  // 256 KB at 1 MB/s is due in 0.5 s, raised to the 1 s floor.
+  assert.equal(fn.hedgeDelay(job(MB), chunk(256 * KB)), 1000);
+  // 1 MB at 512 KB/s is due in 4 s.
+  assert.equal(fn.hedgeDelay(job(512 * KB), chunk(MB)), 4000);
+  // A crawling node is capped at 5 s, a node never measured gets 1.5 s.
+  assert.equal(fn.hedgeDelay(job(50 * KB), chunk(MB)), 5000);
+  assert.equal(fn.hedgeDelay(job(0), chunk(MB)), 1500);
+  // Once chunks have finished, their times rule.
+  assert.equal(fn.hedgeDelay({ durations: [800, 1200], state: { nodes: {} } }, chunk(MB)), 2000);
+});
+
+test("a small Range whose chunks all lag is hedged within about a second", async () => {
+  const store = createStore();
+  const seed = { v: 1, cooldown: 0, assigns: [], nodes: {} };
+  MAINLAND.forEach((host) => { seed.nodes[host] = { bps: MB, at: Date.now(), fail: 0, until: 0 }; });
+  store.write(JSON.stringify(seed), "bili-ripper.state");
+  const cdn = createCdn(2 * MB);
+  const copies = {};
+  // Every first copy hangs, as on cold connections after a pause; the hedges answer at once.
+  const http = (options, callback) => {
+    const start = Number(/^bytes=(\d+)-/.exec(options.headers.Range)[1]);
+    copies[start] = (copies[start] || 0) + 1;
+    if (copies[start] > 1) cdn.get(options, callback);
+  };
+  const began = Date.now();
+  const result = await runHook({
+    request: mediaRequest("bytes=0-1310719"), argument: "threads=4&per_node=1", store, http
+  });
+  assert.equal(result.response.status, 206);
+  assert.deepEqual(Buffer.from(result.response.body), Buffer.from(cdn.file.slice(0, 1310720)));
+  assert.match(result.response.headers["X-Bili-Ripper"], /chunks=4 .*hedged=4$/);
+  // Waiting for a finished chunk would have held every hedge until 5 s.
+  assert.ok(Date.now() - began < 2500, "took " + (Date.now() - began) + "ms");
+});
+
+test("a swap logs its node and how long the headers took; a repeat logs the gap", async () => {
+  const store = createStore();
+  const logs = [];
+  const first = await runHook({ request: mediaRequest("bytes=0-102399"), store, logs });
+  const host = hostOf(first.url);
+  await runHook({ request: mediaRequest("bytes=0-102399"), response: { status: 206, headers: {} }, store, logs });
+  const agent = fn.agentOf({ "User-Agent": "Mozilla/5.0 Chrome/130" });
+  const short = host.replace(".bilivideo.com", "");
+  assert.ok(logs.some((line) => new RegExp("^\\[bili-ripper\\] swap 100KB on " + short + " for client " + agent
+    + ": HTTP 206 after \\d+ms$").test(line)), logs.join("\n"));
+  await runHook({ request: mediaRequest("bytes=0-102399"), store, logs });
+  assert.ok(logs.some((line) => new RegExp("^\\[bili-ripper\\] same Range asked for again \\d+ms after its swap to "
+    + short + " \\(headers came after \\d+ms\\)$").test(line)), logs.join("\n"));
+});

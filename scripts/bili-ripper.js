@@ -33,17 +33,27 @@ const STALE_ASSIGN_MS = 30 * 1000;
 // the same Range being asked for again; a repeat inside it is counted against the node.
 const RETRY_WINDOW_MS = 10 * 1000;
 const MAX_ASSIGNS = 64;
+// Every swap logs its node and how long the node took to send headers; a swap is the one path
+// with no hedge, so a stall there shows up only in this line. Slower than this is marked slow.
+// Surge hands the script the headers, not the end of the body, so the body's time is not known.
+const SLOW_SWAP_LOG_MS = 2000;
 const MAX_ATTEMPTS = 3;
 const CHUNK_TIMEOUT_S = 15;
 // A chunk still running this many times longer than the finished ones is fetched again from
-// another node; whichever copy arrives first is used. Before anything has finished, the fixed
-// delay applies. At most this many extra copies run at once. The lagging node is not blamed,
-// its speed estimate just drops to what it has shown so far, so it sinks in the ranking.
+// another node; whichever copy arrives first is used. At most this many extra copies run at
+// once. The lagging node is not blamed, its speed estimate just drops to what it has shown so
+// far, so it sinks in the ranking.
 const HEDGE_FACTOR = 2;
 // miao (AVPlayer) drops a Range that sends nothing for about 2.3 s, so a lagging chunk has
 // to be fetched again well before that.
 const HEDGE_MIN_MS = 1000;
+// Before any chunk of the Range has finished, a chunk is expected to take as long as its node's
+// measured speed says, times HEDGE_FACTOR, within HEDGE_MIN_MS and HEDGE_FIRST_MS; on a node
+// never measured, HEDGE_UNMEASURED_MS. A small Range starts all its chunks at once, so on cold
+// connections none may finish before the player gives up: waiting for a finished chunk let the
+// first Range after a pause run 2.4-3.8 s without a single hedge.
 const HEDGE_FIRST_MS = 5000;
+const HEDGE_UNMEASURED_MS = 1500;
 const HEDGE_MAX_INFLIGHT = 2;
 // A chunk keeps being watched until it arrives: when a hedge is due but the job has no hedge
 // slot or no free node, it is tried again after HEDGE_RETRY_MS, and a hedge that lags in turn
@@ -51,7 +61,7 @@ const HEDGE_MAX_INFLIGHT = 2;
 const HEDGE_RETRY_MS = 500;
 const HEDGE_MAX_COPIES = 3;
 // A fanout slower than this logs its slowest chunk, with every copy's node and time.
-const SLOW_FANOUT_LOG_MS = 4000;
+const SLOW_FANOUT_LOG_MS = 2000;
 const FANOUT_BUDGET_MS = 25 * 1000;
 // A fanout replies only once the whole Range is in, and players give up on a request that
 // sends nothing for about two seconds, then ask again: the first download is thrown away.
@@ -416,6 +426,16 @@ function assignKey(url, rangeHeader) {
 
 // ---- swap ----
 
+function shortHost(host) {
+  return String(host).replace(/\.bilivideo\.com$/, "");
+}
+
+function describeRange(range) {
+  if (!range) return "whole file";
+  if (range.end === null) return "from " + Math.round(range.start / 1024) + "KB to the end";
+  return Math.round((range.end - range.start + 1) / 1024) + "KB";
+}
+
 function pickSwapNode(config, state, now, url, exclude) {
   const ranked = rankedNodes(config, state, now, exclude);
   return ranked[hashOf(url.path) % Math.min(SWAP_SPREAD, ranked.length)];
@@ -576,10 +596,17 @@ function slowDown(job, host, chunk) {
   }
 }
 
-function hedgeDelay(job) {
-  if (!job.durations.length) return HEDGE_FIRST_MS;
-  const average = job.durations.reduce((sum, ms) => sum + ms, 0) / job.durations.length;
-  return Math.max(HEDGE_MIN_MS, Math.round(average * HEDGE_FACTOR));
+function hedgeDelay(job, chunk) {
+  if (job.durations.length) {
+    const average = job.durations.reduce((sum, ms) => sum + ms, 0) / job.durations.length;
+    return Math.max(HEDGE_MIN_MS, Math.round(average * HEDGE_FACTOR));
+  }
+  const copies = chunk.copies || [];
+  const newest = copies[copies.length - 1];
+  const node = newest && job.state.nodes[newest.host];
+  if (!node || !node.bps) return HEDGE_UNMEASURED_MS;
+  const expected = (chunk.end - chunk.start + 1) * 1000 / node.bps;
+  return Math.min(HEDGE_FIRST_MS, Math.max(HEDGE_MIN_MS, Math.round(expected * HEDGE_FACTOR)));
 }
 
 // Fetches one chunk, starting another copy elsewhere whenever the newest one lags behind the
@@ -642,7 +669,7 @@ function fetchChunkRaced(job, chunk) {
     const watch = () => {
       if (settled || job.aborted) return;
       const now = Date.now();
-      const due = lastLaunch + hedgeDelay(job);
+      const due = lastLaunch + hedgeDelay(job, chunk);
       if (now < due) {
         setTimeout(watch, Math.min(due - now, HEDGE_MIN_MS));
         return;
@@ -653,14 +680,14 @@ function fetchChunkRaced(job, chunk) {
           running().forEach((copy) => slowDown(job, copy.host, chunk));
           job.hedged += 1;
           launch(host, true);
-          setTimeout(watch, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
+          setTimeout(watch, Math.min(hedgeDelay(job, chunk), HEDGE_MIN_MS));
           return;
         }
       }
       setTimeout(watch, HEDGE_RETRY_MS);
     };
     launch(pickChunkNode(job, chunk, false), false);
-    setTimeout(watch, Math.min(hedgeDelay(job), HEDGE_MIN_MS));
+    setTimeout(watch, Math.min(hedgeDelay(job, chunk), HEDGE_MIN_MS));
   });
 }
 
@@ -668,7 +695,7 @@ function fetchChunkRaced(job, chunk) {
 function describeSlowest(job) {
   const slowest = job.done.slice().sort((a, b) => (b.doneAt - b.firstAt) - (a.doneAt - a.firstAt))[0];
   if (!slowest) return "";
-  const copies = slowest.copies.map((copy) => copy.host.replace(".bilivideo.com", "") + " "
+  const copies = slowest.copies.map((copy) => shortHost(copy.host) + " "
     + (copy.ms === undefined ? "still running at " + (slowest.doneAt - copy.began) + "ms" : copy.result + " in " + copy.ms + "ms")
     + " (from +" + (copy.began - slowest.firstAt) + "ms)");
   return "slowest chunk " + slowest.start + "-" + slowest.end + " took " + (slowest.doneAt - slowest.firstAt)
@@ -813,21 +840,23 @@ function onRequest() {
   const stale = state.assigns.filter((entry) => entry.key === key)[0];
   if (stale) {
     const reason = stale.answered ? "the same Range was asked for again after its reply" : "no response to the last request";
+    console.log("[bili-ripper] same Range asked for again " + (now - stale.at) + "ms after its swap to " + shortHost(stale.host)
+      + (stale.answered ? " (headers came after " + (stale.answered - stale.at) + "ms)" : " (no headers yet)"));
     recordNode(state, stale.host, false, 0, now, reason, BLIP_BAN_MS);
     if (exclude.indexOf(stale.host) < 0) exclude.push(stale.host);
     state.assigns = state.assigns.filter((entry) => entry !== stale);
   }
 
+  const agent = agentOf($request.headers);
   const host = pickSwapNode(config, state, now, url, exclude);
   const swap = () => {
-    state.assigns.push({ key, host, at: Date.now() });
+    state.assigns.push({ key, host, at: Date.now(), agent });
     if (state.assigns.length > MAX_ASSIGNS) state.assigns = state.assigns.slice(-MAX_ASSIGNS);
     saveState(state);
     $done({ url: "https://" + host + url.path + url.query, headers: swappedHeaders($request.headers, host) });
   };
 
   const range = parseRange(rangeHeader);
-  const agent = agentOf($request.headers);
   const impatient = noteClient(agent, key, now);
   if (!fanoutEligible($request, config, state, range, now, impatient)) {
     swap();
@@ -860,10 +889,14 @@ function onResponse() {
   }
   const now = Date.now();
   const state = loadState(now);
-  const key = assignKey(url, header($request.headers, "range"));
+  const rangeHeader = header($request.headers, "range");
+  const key = assignKey(url, rangeHeader);
   const entry = state.assigns.filter((item) => item.key === key && !item.answered)[0];
   if (entry) {
     const status = Number($response.status || $response.statusCode) || 0;
+    const ms = now - entry.at;
+    console.log("[bili-ripper] swap " + describeRange(parseRange(rangeHeader)) + " on " + shortHost(entry.host)
+      + " for client " + (entry.agent || "?") + ": HTTP " + status + " after " + ms + "ms" + (ms > SLOW_SWAP_LOG_MS ? " (slow)" : ""));
     const ok = status >= 200 && status < 400;
     if (ok) {
       // Counted as a success once RETRY_WINDOW_MS passes without the same Range coming back.

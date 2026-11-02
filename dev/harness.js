@@ -32,7 +32,8 @@ function loadFunctions() {
 }
 
 // Runs one hook and resolves with what the script passed to $done.
-function runHook({ request, response, argument = "", store, http }) {
+// Lines the script logs are pushed onto logs when it is given.
+function runHook({ request, response, argument = "", store, http, logs }) {
   return new Promise((resolve, reject) => {
     const globals = {
       $request: request,
@@ -42,6 +43,7 @@ function runHook({ request, response, argument = "", store, http }) {
       $done: resolve
     };
     if (response) globals.$response = response;
+    if (logs) globals.console = { log: (line) => logs.push(String(line)) };
     try { createContext(globals); } catch (error) { reject(error); }
   });
 }
