@@ -788,8 +788,14 @@ test("swap speeds are read from Surge's list of recent requests, each request on
     callback({ requests });
   };
   const respond = () => runHook({ request: mediaRequest("bytes=0-4095"), response: { status: 206, headers: {} }, store, api });
+  // The wait for headers is not part of the body's time.
+  const seeded = state(store);
+  seeded.nodes[host] = Object.assign(seeded.nodes[host] || { bps: 0, at: 0, fail: 0, until: 0 }, { lag: 100, lagAt: Date.now() });
+  store.write(JSON.stringify(seeded), "bili-ripper.state");
+  const lagNow = () => state(store).nodes[host].lag / 1000;
   await respond();
-  assert.equal(state(store).nodes[host].swapBps, 4 * MB);
+  const firstBps = state(store).nodes[host].swapBps;
+  assert.ok(firstBps > 4 * MB && firstBps < 6 * MB, String(firstBps));
   assert.equal(state(store).nodes["upos-sz-mirrorxx.bilivideo.com"], undefined);
   // Asked again too soon: no second read.
   await respond();
@@ -801,7 +807,8 @@ test("swap speeds are read from Surge's list of recent requests, each request on
   requests.push(listed(host, 2 * MB, 2, 1005));
   await respond();
   assert.equal(calls, 2);
-  assert.equal(state(store).nodes[host].swapBps, Math.round(4 * MB * 0.7 + MB * 0.3));
+  const expected = firstBps * 0.7 + (2 * MB / (2 - lagNow())) * 0.3;
+  assert.ok(Math.abs(state(store).nodes[host].swapBps - expected) < 0.05 * MB, String(state(store).nodes[host].swapBps));
 });
 
 test("a Range the swap node brings in faster than the recent fanouts is swapped, a slower one fanned out", async () => {
@@ -810,7 +817,7 @@ test("a Range the swap node brings in faster than the recent fanouts is swapped,
     const store = createStore();
     const now = Date.now();
     const nodes = {};
-    MAINLAND.forEach((host) => { nodes[host] = { bps: 1e6, at: now, fail: 0, until: 0, swapBps, swapAt: now }; });
+    MAINLAND.forEach((host) => { nodes[host] = { bps: 1e6, at: now, fail: 0, until: 0, swapBps, swapAt: now, lag: 250, lagAt: now }; });
     // A patient client: the fanout would answer within its 15 s either way.
     store.write(JSON.stringify({ v: 1, nodes, cooldown: 0, assigns: [], fanoutBps: 600 * KB, fanoutAt: now - 20 * 60 * 1000, fanoutSamples: 5 }), "bili-ripper.state");
     const logs = [];
@@ -819,7 +826,8 @@ test("a Range the swap node brings in faster than the recent fanouts is swapped,
   };
   const quick = await run(5 * MB);
   assert.ok(quick.result.url);
-  assert.ok(quick.logs.some((line) => /beats fanout at 600KB\/s/.test(line)), quick.logs.join("\n"));
-  const slow = await run(300 * KB);
+  assert.ok(quick.logs.some((line) => /would take 550ms, fanout 2560ms/.test(line)), quick.logs.join("\n"));
+  // Faster than the fanout by speed alone, but not once the wait for headers is added.
+  const slow = await run(660 * KB);
   assert.equal(slow.result.response.status, 206);
 });

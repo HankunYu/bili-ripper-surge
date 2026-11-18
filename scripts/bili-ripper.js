@@ -115,10 +115,12 @@ const SWAP_SPREAD = 3;
 const SWAP_LAG_SLACK_MS = 300;
 // The hooks never see a swap's body arrive, so its speed is read from Surge's own list of
 // recent requests, at most this often. Only replies of MIN_CHUNK_BYTES or more count: a small
-// one measures the wait for headers, not the speed. A Range the swap node brings in faster
-// than the recent fanouts did is swapped: every chunk request opens a new connection, so on
-// a long route a fanout can lose to one warm connection.
+// one measures the wait for headers, not the speed, and the wait for headers is taken off the
+// larger ones for the same reason. A Range the swap node would bring in sooner than the recent
+// fanouts did is swapped: every chunk request opens a new connection, so on a long route a
+// fanout can lose to one warm connection.
 const SWAP_SCAN_MS = 5000;
+const SWAP_BODY_MIN_S = 0.05;
 const SWAP_SCAN_TIMEOUT_MS = 1000;
 const RECENT_REQUESTS_API = "/v1/requests/recent";
 
@@ -463,7 +465,7 @@ function recordLag(state, host, ms, now) {
   node.lagAt = now;
 }
 
-// The node's recent speed over a whole swap, in bytes per second; 0 when not measured.
+// The node's recent speed over a swap's body, in bytes per second; 0 when not measured.
 function swapSpeed(state, host, now) {
   const node = state.nodes[host];
   return node && node.swapBps && now - node.swapAt <= SPEED_TTL_MS ? node.swapBps : 0;
@@ -505,7 +507,8 @@ function noteSwapSpeeds(state, requests, now) {
     const seconds = item.completedDate - item.startDate;
     if (isOwnRequest(item) || !isMediaUrl(url) || !state.nodes[url.host]) return;
     if (!(item.inBytes >= MIN_CHUNK_BYTES) || !(seconds > 0)) return;
-    recordSwapSpeed(state, url.host, item.inBytes / seconds, now);
+    const body = Math.max(seconds - (lagOf(state, url.host, now) || 0) / 1000, SWAP_BODY_MIN_S);
+    recordSwapSpeed(state, url.host, item.inBytes / body, now);
   });
 }
 
@@ -911,9 +914,11 @@ function fanoutEligible(request, config, state, range, now, impatient, host) {
   // fanout runs to renew it, and measuring it again costs a few slow replies.
   const fanoutBps = fanoutSpeed(state, now, SPEED_TTL_MS);
   const swapBps = swapSpeed(state, host, now);
-  if (fanoutBps && swapBps > fanoutBps) {
-    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: " + shortHost(host) + " at "
-      + Math.round(swapBps / 1024) + "KB/s beats fanout at " + Math.round(fanoutBps / 1024) + "KB/s");
+  const fanoutMs = fanoutBps ? Math.round(length * 1000 / fanoutBps) : 0;
+  const swapMs = swapBps ? Math.round((lagOf(state, host, now) || 0) + length * 1000 / swapBps) : 0;
+  if (fanoutMs && swapMs && swapMs < fanoutMs) {
+    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: " + shortHost(host) + " would take "
+      + swapMs + "ms, fanout " + fanoutMs + "ms");
     return false;
   }
   return true;
