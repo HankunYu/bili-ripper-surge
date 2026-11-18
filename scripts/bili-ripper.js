@@ -107,6 +107,20 @@ const MIN_CHUNK_BYTES = 256 * 1024;
 const SLOW_NODE_RATIO = 1 / 3;
 // Swap mode spreads files over this many of the best nodes.
 const SWAP_SPREAD = 3;
+// A swap streams from the node's first byte, so swap nodes are ranked by how long they take
+// to send headers, not by their fanout speed: estgoss took about a second every time, and the
+// web player gives up at two. A node slower than the quickest one by more than this gets no
+// swaps; the rest keep their fanout order, so a file stays on its node. A time older than
+// SPEED_TTL_MS counts as unmeasured, so a slow node gets another try later.
+const SWAP_LAG_SLACK_MS = 300;
+// The hooks never see a swap's body arrive, so its speed is read from Surge's own list of
+// recent requests, at most this often. Only replies of MIN_CHUNK_BYTES or more count: a small
+// one measures the wait for headers, not the speed. A Range the swap node brings in faster
+// than the recent fanouts did is swapped: every chunk request opens a new connection, so on
+// a long route a fanout can lose to one warm connection.
+const SWAP_SCAN_MS = 5000;
+const SWAP_SCAN_TIMEOUT_MS = 1000;
+const RECENT_REQUESTS_API = "/v1/requests/recent";
 
 const PRESETS = {
   mainland: [
@@ -436,9 +450,88 @@ function describeRange(range) {
   return Math.round((range.end - range.start + 1) / 1024) + "KB";
 }
 
+// How long the node recently took to send a swap's headers; null when not measured.
+function lagOf(state, host, now) {
+  const node = state.nodes[host];
+  return node && node.lagAt && now - node.lagAt <= SPEED_TTL_MS ? node.lag : null;
+}
+
+function recordLag(state, host, ms, now) {
+  const node = nodeOf(state, host);
+  const known = lagOf(state, host, now);
+  node.lag = known === null ? Math.round(ms) : Math.round(known * 0.7 + ms * 0.3);
+  node.lagAt = now;
+}
+
+// The node's recent speed over a whole swap, in bytes per second; 0 when not measured.
+function swapSpeed(state, host, now) {
+  const node = state.nodes[host];
+  return node && node.swapBps && now - node.swapAt <= SPEED_TTL_MS ? node.swapBps : 0;
+}
+
+function recordSwapSpeed(state, host, bps, now) {
+  const node = nodeOf(state, host);
+  const known = swapSpeed(state, host, now);
+  node.swapBps = Math.round(known ? known * 0.7 + bps * 0.3 : bps);
+  node.swapAt = now;
+}
+
+// The best nodes in fanout order, without those known to send headers much later than the
+// quickest one. Nodes whose last contact failed only serve when no other is left.
 function pickSwapNode(config, state, now, url, exclude) {
   const ranked = rankedNodes(config, state, now, exclude);
-  return ranked[hashOf(url.path) % Math.min(SWAP_SPREAD, ranked.length)];
+  const usable = ranked.filter((host) => isSuspect(state, host) === isSuspect(state, ranked[0]));
+  const lags = usable.map((host) => lagOf(state, host, now)).filter((lag) => lag !== null);
+  const limit = Math.min.apply(null, lags) + SWAP_LAG_SLACK_MS;
+  const pool = usable.filter((host) => !(lagOf(state, host, now) > limit));
+  return pool[hashOf(url.path) % Math.min(SWAP_SPREAD, pool.length)];
+}
+
+// A request Surge lists that the script itself sent: a fanout chunk, not a player's download.
+function isOwnRequest(item) {
+  return item.sourceAddress === "127.0.0.1" && (!item.processPath || /\/Surge$/.test(item.processPath));
+}
+
+// Reads the speed of finished swaps from Surge's list of recent requests, each one once.
+// A fanned-out request shows no bytes from the remote side, so it never counts here.
+function noteSwapSpeeds(state, requests, now) {
+  const since = state.scannedTo || 0;
+  const finished = (Array.isArray(requests) ? requests : [])
+    .filter((item) => item && item.completed && !item.failed && Number(item.completedDate) > since)
+    .sort((a, b) => a.completedDate - b.completedDate);
+  finished.forEach((item) => {
+    state.scannedTo = Number(item.completedDate);
+    const url = parseUrl(item.URL);
+    const seconds = item.completedDate - item.startDate;
+    if (isOwnRequest(item) || !isMediaUrl(url) || !state.nodes[url.host]) return;
+    if (!(item.inBytes >= MIN_CHUNK_BYTES) || !(seconds > 0)) return;
+    recordSwapSpeed(state, url.host, item.inBytes / seconds, now);
+  });
+}
+
+// Runs the scan when one is due, then calls back; a list that does not come is not waited for.
+// The state is read again once the list is in, so what other requests saved meanwhile is kept.
+function scanSwaps(state, now, done) {
+  if (typeof $httpAPI !== "function" || now - (state.scanAt || 0) < SWAP_SCAN_MS) {
+    done();
+    return;
+  }
+  let over = false;
+  const finish = () => {
+    if (over) return;
+    over = true;
+    done();
+  };
+  setTimeout(finish, SWAP_SCAN_TIMEOUT_MS);
+  $httpAPI("GET", RECENT_REQUESTS_API, null, (result) => {
+    if (over) return;
+    const at = Date.now();
+    const fresh = loadState(at);
+    noteSwapSpeeds(fresh, result && result.requests, at);
+    fresh.scanAt = at;
+    saveState(fresh);
+    finish();
+  });
 }
 
 // Every node holds the same bytes under its own ETag, so an If-Range carried over from
@@ -472,9 +565,15 @@ function evenChunkBytes(length, config) {
 // The largest Range the recent fanout speed brings in within the client's target time;
 // Infinity while there is no recent speed or it rests on too few fanouts.
 function budgetBytes(state, now, impatient) {
-  if (!state.fanoutBps || now - state.fanoutAt > FANOUT_SPEED_TTL_MS) return Infinity;
-  if ((state.fanoutSamples || 0) < FANOUT_MIN_SAMPLES) return Infinity;
-  return Math.floor(state.fanoutBps * (impatient ? FANOUT_TARGET_MS : PATIENT_TARGET_MS) / 1000);
+  const bps = fanoutSpeed(state, now, FANOUT_SPEED_TTL_MS);
+  return bps ? Math.floor(bps * (impatient ? FANOUT_TARGET_MS : PATIENT_TARGET_MS) / 1000) : Infinity;
+}
+
+// The speed of the recent fanouts, in bytes per second; 0 when it is older than ttl or rests
+// on too few of them.
+function fanoutSpeed(state, now, ttl) {
+  if (!state.fanoutBps || now - state.fanoutAt > ttl) return 0;
+  return (state.fanoutSamples || 0) < FANOUT_MIN_SAMPLES ? 0 : state.fanoutBps;
 }
 
 function recordFanout(state, bytes, ms, now) {
@@ -793,7 +892,7 @@ async function fanout(request, url, config, state, range, impatient) {
   return { status: 206, headers, body };
 }
 
-function fanoutEligible(request, config, state, range, now, impatient) {
+function fanoutEligible(request, config, state, range, now, impatient, host) {
   if (config.mode !== "fanout" || String(request.method || "GET").toUpperCase() !== "GET") return false;
   if (!range || state.cooldown > now) return false;
   if (range.end === null) return config.openRange === "clip";
@@ -803,10 +902,21 @@ function fanoutEligible(request, config, state, range, now, impatient) {
     console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: over MaxMB " + config.maxBytes / 1048576);
     return false;
   }
-  if (length <= budgetBytes(state, now, impatient)) return true;
-  console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB" + (impatient ? "" : " (patient client)") + ": fanout at "
-    + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
-  return false;
+  if (length > budgetBytes(state, now, impatient)) {
+    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB" + (impatient ? "" : " (patient client)") + ": fanout at "
+      + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
+    return false;
+  }
+  // The fanout speed is kept longer here than for the budget: while the swap node wins, no
+  // fanout runs to renew it, and measuring it again costs a few slow replies.
+  const fanoutBps = fanoutSpeed(state, now, SPEED_TTL_MS);
+  const swapBps = swapSpeed(state, host, now);
+  if (fanoutBps && swapBps > fanoutBps) {
+    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: " + shortHost(host) + " at "
+      + Math.round(swapBps / 1024) + "KB/s beats fanout at " + Math.round(fanoutBps / 1024) + "KB/s");
+    return false;
+  }
+  return true;
 }
 
 // ---- hooks ----
@@ -843,6 +953,8 @@ function onRequest() {
     console.log("[bili-ripper] same Range asked for again " + (now - stale.at) + "ms after its swap to " + shortHost(stale.host)
       + (stale.answered ? " (headers came after " + (stale.answered - stale.at) + "ms)" : " (no headers yet)"));
     recordNode(state, stale.host, false, 0, now, reason, BLIP_BAN_MS);
+    // Headers that had not come by now took at least this long.
+    if (!stale.answered && now - stale.at > (lagOf(state, stale.host, now) || 0)) recordLag(state, stale.host, now - stale.at, now);
     if (exclude.indexOf(stale.host) < 0) exclude.push(stale.host);
     state.assigns = state.assigns.filter((entry) => entry !== stale);
   }
@@ -858,7 +970,7 @@ function onRequest() {
 
   const range = parseRange(rangeHeader);
   const impatient = noteClient(agent, key, now);
-  if (!fanoutEligible($request, config, state, range, now, impatient)) {
+  if (!fanoutEligible($request, config, state, range, now, impatient, host)) {
     swap();
     return;
   }
@@ -901,6 +1013,7 @@ function onResponse() {
     if (ok) {
       // Counted as a success once RETRY_WINDOW_MS passes without the same Range coming back.
       entry.answered = now;
+      recordLag(state, entry.host, ms, now);
     } else {
       // A refusal counts against the file once two nodes have refused it, else against the node.
       if (!isRefusal(status) || !noteRefusal(state, url.path, entry.host, now)) {
@@ -910,7 +1023,7 @@ function onResponse() {
     }
     saveState(state);
   }
-  $done({});
+  scanSwaps(state, now, () => $done({}));
 }
 
 if (typeof $request !== "undefined") {

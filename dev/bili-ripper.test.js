@@ -727,3 +727,99 @@ test("a swap logs its node and how long the headers took; a repeat logs the gap"
   assert.ok(logs.some((line) => new RegExp("^\\[bili-ripper\\] same Range asked for again \\d+ms after its swap to "
     + short + " \\(headers came after \\d+ms\\)$").test(line)), logs.join("\n"));
 });
+
+test("a node that sends swap headers much later than the quickest one gets no swaps", () => {
+  const [a, b, c, d] = MAINLAND;
+  const config = fn.parseConfig("nodes=" + [a, b, c, d].join("|"));
+  const now = 5e9;
+  const node = (bps, lag) => Object.assign({ bps, at: now, fail: 0, until: 0 }, lag ? { lag, lagAt: now } : {});
+  // By fanout speed a comes first, but its headers take a second.
+  const st = { nodes: { [a]: node(9e6, 1000), [b]: node(5e6, 250), [c]: node(4e6, 400), [d]: node(1e6) } };
+  const picked = new Set();
+  for (let i = 0; i < 40; i++) picked.add(fn.pickSwapNode(config, st, now, { path: PATH + i }, []));
+  assert.deepEqual([...picked].sort(), [b, c, d].sort());
+  // An old measurement no longer keeps the node out.
+  st.nodes[a].lagAt = now - 2 * 60 * 60 * 1000;
+  assert.equal(fn.lagOf(st, a, now), null);
+  for (let i = 0; i < 40; i++) picked.add(fn.pickSwapNode(config, st, now, { path: PATH + i }, []));
+  assert.ok(picked.has(a));
+});
+
+test("the response hook records how long a swap's headers took; a repeat with none counts as at least the gap", async () => {
+  const store = createStore();
+  const first = await runHook({ request: mediaRequest("bytes=0-4095"), argument: "mode=swap", store });
+  const host = hostOf(first.url);
+  await runHook({ request: mediaRequest("bytes=0-4095"), response: { status: 206, headers: {} }, store });
+  const lag = state(store).nodes[host].lag;
+  assert.ok(lag >= 0 && lag < 200, String(lag));
+
+  const second = await runHook({ request: mediaRequest("bytes=4096-8191"), argument: "mode=swap", store });
+  const saved = state(store);
+  saved.assigns.forEach((entry) => { entry.at -= 2050; });
+  store.write(JSON.stringify(saved), "bili-ripper.state");
+  await runHook({ request: mediaRequest("bytes=4096-8191"), argument: "mode=swap", store });
+  assert.ok(state(store).nodes[hostOf(second.url)].lag > 500);
+});
+
+// One entry of Surge's list of recent requests.
+function listed(host, inBytes, seconds, completedDate, extra = {}) {
+  return Object.assign({
+    URL: "https://" + host + PATH + QUERY, sourceAddress: "192.168.50.111", completed: true, failed: false,
+    inBytes, startDate: completedDate - seconds, completedDate
+  }, extra);
+}
+
+test("swap speeds are read from Surge's list of recent requests, each request once", async () => {
+  const store = createStore();
+  const first = await runHook({ request: mediaRequest("bytes=0-4095"), argument: "mode=swap", store });
+  const host = hostOf(first.url);
+  const requests = [
+    listed(host, 2 * MB, 0.5, 1000),
+    // Too small to tell a speed, a fanout chunk of the script's own, a fanned-out reply, a node never used.
+    listed(host, 50 * KB, 0.2, 1001),
+    listed(host, MB, 4, 1002, { sourceAddress: "127.0.0.1", processPath: "/Applications/Surge.app/Contents/MacOS/Surge" }),
+    listed(host, 0, 2, 1003),
+    listed("upos-sz-mirrorxx.bilivideo.com", 2 * MB, 0.5, 1004)
+  ];
+  let calls = 0;
+  const api = (method, path, body, callback) => {
+    calls += 1;
+    assert.equal(path, "/v1/requests/recent");
+    callback({ requests });
+  };
+  const respond = () => runHook({ request: mediaRequest("bytes=0-4095"), response: { status: 206, headers: {} }, store, api });
+  await respond();
+  assert.equal(state(store).nodes[host].swapBps, 4 * MB);
+  assert.equal(state(store).nodes["upos-sz-mirrorxx.bilivideo.com"], undefined);
+  // Asked again too soon: no second read.
+  await respond();
+  assert.equal(calls, 1);
+  // Once due again, the request already counted is not counted twice.
+  const saved = state(store);
+  saved.scanAt -= 6000;
+  store.write(JSON.stringify(saved), "bili-ripper.state");
+  requests.push(listed(host, 2 * MB, 2, 1005));
+  await respond();
+  assert.equal(calls, 2);
+  assert.equal(state(store).nodes[host].swapBps, Math.round(4 * MB * 0.7 + MB * 0.3));
+});
+
+test("a Range the swap node brings in faster than the recent fanouts is swapped, a slower one fanned out", async () => {
+  const cdn = createCdn(8 * MB);
+  const run = async (swapBps) => {
+    const store = createStore();
+    const now = Date.now();
+    const nodes = {};
+    MAINLAND.forEach((host) => { nodes[host] = { bps: 1e6, at: now, fail: 0, until: 0, swapBps, swapAt: now }; });
+    // A patient client: the fanout would answer within its 15 s either way.
+    store.write(JSON.stringify({ v: 1, nodes, cooldown: 0, assigns: [], fanoutBps: 600 * KB, fanoutAt: now - 20 * 60 * 1000, fanoutSamples: 5 }), "bili-ripper.state");
+    const logs = [];
+    const result = await runHook({ request: mediaRequest("bytes=0-1572863"), store, http: cdn.get, logs });
+    return { result, logs };
+  };
+  const quick = await run(5 * MB);
+  assert.ok(quick.result.url);
+  assert.ok(quick.logs.some((line) => /beats fanout at 600KB\/s/.test(line)), quick.logs.join("\n"));
+  const slow = await run(300 * KB);
+  assert.equal(slow.result.response.status, 206);
+});

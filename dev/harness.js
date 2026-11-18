@@ -33,7 +33,7 @@ function loadFunctions() {
 
 // Runs one hook and resolves with what the script passed to $done.
 // Lines the script logs are pushed onto logs when it is given.
-function runHook({ request, response, argument = "", store, http, logs }) {
+function runHook({ request, response, argument = "", store, http, logs, api }) {
   return new Promise((resolve, reject) => {
     const globals = {
       $request: request,
@@ -43,6 +43,8 @@ function runHook({ request, response, argument = "", store, http, logs }) {
       $done: resolve
     };
     if (response) globals.$response = response;
+    // Surge's own HTTP API, which the response hook reads the list of recent requests from.
+    if (api) globals.$httpAPI = api;
     if (logs) globals.console = { log: (line) => logs.push(String(line)) };
     try { createContext(globals); } catch (error) { reject(error); }
   });
