@@ -1,7 +1,7 @@
 // Bili Ripper for Surge.
-// Moves Bilibili media requests onto chosen upos nodes and, in fanout mode, downloads one
-// Range from several nodes at once. Node lists and relay detection follow
-// Bilibili-thread-ripper (MIT, MrTangLuyao).
+// Moves Bilibili media requests onto the upos node measured to be quickest and, in fanout
+// mode, downloads a Range from several nodes at once when no single node is quick enough.
+// Node lists and relay detection follow Bilibili-thread-ripper (MIT, MrTangLuyao).
 //
 // One file serves two hooks: http-request (swap / fanout) and http-response (node health).
 
@@ -9,14 +9,19 @@ const STATE_KEY = "bili-ripper.state";
 // A node that refused twice in a row is left alone for a while; one that merely gave no
 // reply is tried again much sooner, since that is usually a passing connection problem.
 // Each ban in a row lasts twice as long as the one before, up to BAN_MAX_MS, so a node that
-// is down for good stops being tried every minute; any success resets the run.
+// refuses this address for good is tried about once a day; any success resets the run.
 const BAN_MS = 5 * 60 * 1000;
 const BLIP_BAN_MS = 60 * 1000;
-const BAN_MAX_MS = 30 * 60 * 1000;
-// A file refused by two nodes stays on its original host for this long: some files are only
-// served by the host Bilibili named. The record lives in state.refused, keyed by the file's
-// directory, which holds every stream of one video.
+const BAN_MAX_MS = 24 * 60 * 60 * 1000;
+// Some files are only served by the host Bilibili named: such a file stays on its original
+// host for this long. Some nodes refuse everything from an address, though, so it takes two
+// refusals from nodes that served something within PROVEN_MS, or HOSTILE_ANY refusals from
+// any nodes, with no node serving the file in between. Until then a refusal counts against
+// the node. The record lives in state.refused, keyed by the file's directory, which holds
+// every stream of one video.
 const HOSTILE_MS = 10 * 60 * 1000;
+const PROVEN_MS = 10 * 60 * 1000;
+const HOSTILE_ANY = 4;
 const MAX_REFUSED = 32;
 // Bilibili refuses every node for about a minute after a burst from one address. Two videos
 // refused within this window mean the address is throttled: fanout pauses, twice as long
@@ -29,8 +34,9 @@ const SPEED_TTL_MS = 60 * 60 * 1000;
 // A swapped request that got no response within this window is counted against its node.
 const STALE_ASSIGN_MS = 30 * 1000;
 // A node may send the headers of a good reply and then no body; the player gives up and asks
-// for the same Range again. So a good status only counts once this window has passed without
-// the same Range being asked for again; a repeat inside it is counted against the node.
+// for the same Range again. A repeat inside this window goes to another node. The node is not
+// blamed for it: players also read a Range twice of their own accord (miao does), and what the
+// node really sent shows in its measured speed.
 const RETRY_WINDOW_MS = 10 * 1000;
 const MAX_ASSIGNS = 64;
 // Every swap logs its node and how long the node took to send headers; a swap is the one path
@@ -105,22 +111,46 @@ const MIN_CHUNK_BYTES = 256 * 1024;
 // it and every Range waited for a hedge. Fast nodes take an extra stream instead. Slow nodes
 // still serve hedges and the probe, so their speed is measured again.
 const SLOW_NODE_RATIO = 1 / 3;
-// Swap mode spreads files over this many of the best nodes.
+// A swap rides Surge's warm connection to the node and streams from the first byte, while
+// every chunk request of a fanout opens a new connection and the reply waits for the last
+// chunk: over nine days of logs a good node brought a swapped 1-3 MB in 0.3 s, fanouts took
+// 0.3-2.4 s depending on the day, and six in ten fanouts over 2 s were dropped by the player.
+// So a Range is swapped to the node expected to bring it in soonest, and fanned out only when
+// no node is known to be quick enough.
+//
+// A node's time for a Range is its wait for headers plus the Range's size over its measured
+// swap speed. Nodes within SWAP_NEAR_RATIO (plus SWAP_NEAR_MS) of the best time share the
+// files, each file staying on one of them. A speed ranks its node for SWAP_FORGET_MS: an old
+// one that no longer holds is corrected by the first swap it wins. While no node has one,
+// nodes are taken in fanout order, SWAP_SPREAD of them, leaving out those that send headers
+// more than SWAP_LAG_SLACK_MS later than the quickest.
 const SWAP_SPREAD = 3;
-// A swap streams from the node's first byte, so swap nodes are ranked by how long they take
-// to send headers, not by their fanout speed: estgoss took about a second every time, and the
-// web player gives up at two. A node slower than the quickest one by more than this gets no
-// swaps; the rest keep their fanout order, so a file stays on its node. A time older than
-// SPEED_TTL_MS counts as unmeasured, so a slow node gets another try later.
 const SWAP_LAG_SLACK_MS = 300;
-// The hooks never see a swap's body arrive, so its speed is read from Surge's own list of
-// recent requests, at most this often. Only replies of MIN_CHUNK_BYTES or more count: a small
-// one measures the wait for headers, not the speed, and the wait for headers is taken off the
-// larger ones for the same reason. A Range the swap node would bring in sooner than the recent
-// fanouts did is swapped: every chunk request opens a new connection, so on a long route a
-// fanout can lose to one warm connection.
+const SWAP_NEAR_RATIO = 1.25;
+const SWAP_NEAR_MS = 100;
+// A swap expected to finish within this time is taken without asking how a fanout would do.
+const SWAP_GOOD_MS = 1500;
+// The other nodes have to be measured too, or nothing is known when the best one turns bad.
+// So at most every PROBE_GAP_MS one Range that would be swapped anyway, of MIN_CHUNK_BYTES or
+// more so that it measures speed, goes to a node not measured within SPEED_TTL_MS: first the
+// ones with no speed on record, then, while fewer than PROBE_KEEP nodes are measured, the one
+// that was best when last measured. A node is probed once per SPEED_TTL_MS, and not while its
+// headers alone are known to take longer than SWAP_GOOD_MS.
+// Nodes whose last contact failed get no probe; a fanout chunk has to succeed on them first.
+const PROBE_GAP_MS = 30 * 1000;
+const PROBE_KEEP = 3;
+const SWAP_FORGET_MS = 24 * 60 * 60 * 1000;
+// The hooks never see a swap's body arrive, so its outcome is read from Surge's own list of
+// recent requests, at most this often, and logged. A reply of MIN_CHUNK_BYTES or more measures
+// the node's speed, with the wait for headers taken off; a smaller one measures only that
+// wait. A request dropped after SWAP_STALL_S with less than that is a stall: it counts as the
+// speed it shows, and for more than a finished reply does, so that two stalls move the
+// traffic to the next node.
 const SWAP_SCAN_MS = 5000;
 const SWAP_BODY_MIN_S = 0.05;
+const SWAP_STALL_S = 1;
+const SWAP_SPEED_WEIGHT = 0.3;
+const SWAP_STALL_WEIGHT = 0.5;
 const SWAP_SCAN_TIMEOUT_MS = 1000;
 const RECENT_REQUESTS_API = "/v1/requests/recent";
 
@@ -250,12 +280,8 @@ function loadState(now) {
     const node = state.nodes[host];
     if (node.until <= now) node.until = 0;
   }
-  state.assigns = state.assigns.filter((entry) => {
-    if (!entry.answered) return now - entry.at < STALE_ASSIGN_MS;
-    if (now - entry.answered < RETRY_WINDOW_MS) return true;
-    recordNode(state, entry.host, true, 0, now);
-    return false;
-  });
+  state.assigns = state.assigns.filter((entry) => now - (entry.answered || entry.at)
+    < (entry.answered ? RETRY_WINDOW_MS : STALE_ASSIGN_MS));
   for (const dir in state.refused) {
     if (now - state.refused[dir].at > HOSTILE_MS) delete state.refused[dir];
   }
@@ -362,6 +388,7 @@ function recordNode(state, host, ok, bps, now, reason, banMs) {
     node.fail = 0;
     node.bans = 0;
     node.suspect = false;
+    node.okAt = now;
     if (bps > 0) {
       node.bps = node.bps ? Math.round(node.bps * 0.7 + bps * 0.3) : Math.round(bps);
       node.at = now;
@@ -395,23 +422,40 @@ function dirOf(path) {
   return path.slice(0, path.lastIndexOf("/") + 1);
 }
 
-function isHostile(state, path, now) {
-  const entry = state.refused[dirOf(path)];
-  return !!entry && entry.hosts.length >= 2 && now - entry.at <= HOSTILE_MS;
+function isHostileDir(state, dir, now) {
+  const entry = state.refused[dir];
+  return !!entry && now - entry.at <= HOSTILE_MS && (entry.proven >= 2 || entry.fresh >= HOSTILE_ANY);
 }
 
-// Notes that a node refused a file. Returns true once the file counts as hostile, and starts
-// the cooldown when another video was refused just before: that is the address being throttled.
+function isHostile(state, path, now) {
+  return isHostileDir(state, dirOf(path), now);
+}
+
+// Notes that a node served a file: the refusals before it were the nodes' own. The nodes
+// that refused stay on record, so the file is not sent to them again.
+function noteServed(state, path) {
+  const entry = state.refused[dirOf(path)];
+  if (entry) entry.proven = entry.fresh = 0;
+}
+
+// Notes that a node refused a file. Returns true when the refusal is the file's and not the
+// node's, which is once the file counts as hostile, and starts the cooldown when another
+// video was refused just before: that is the address being throttled.
 function noteRefusal(state, path, host, now) {
   const dir = dirOf(path);
-  const hostile = isHostile(state, path, now);
-  const entry = state.refused[dir] || (state.refused[dir] = { hosts: [], at: 0 });
-  if (entry.hosts.indexOf(host) < 0) entry.hosts.push(host);
+  const hostile = isHostileDir(state, dir, now);
+  const entry = state.refused[dir] || (state.refused[dir] = { hosts: [], proven: 0, fresh: 0, at: 0 });
+  if (entry.hosts.indexOf(host) < 0) {
+    const node = state.nodes[host];
+    entry.hosts.push(host);
+    entry.fresh += 1;
+    if (node && node.okAt && now - node.okAt <= PROVEN_MS) entry.proven += 1;
+  }
   entry.at = now;
   const dirs = Object.keys(state.refused).sort((a, b) => state.refused[a].at - state.refused[b].at);
   dirs.splice(0, Math.max(dirs.length - MAX_REFUSED, 0)).forEach((old) => { delete state.refused[old]; });
-  if (hostile || !isHostile(state, path, now)) return hostile;
-  const others = dirs.filter((other) => other !== dir && state.refused[other].hosts.length >= 2
+  if (hostile || !isHostileDir(state, dir, now)) return hostile;
+  const others = dirs.filter((other) => other !== dir && isHostileDir(state, other, now)
     && now - state.refused[other].at <= COOLDOWN_MS);
   if (others.length) startCooldown(state, now);
   return true;
@@ -471,18 +515,54 @@ function swapSpeed(state, host, now) {
   return node && node.swapBps && now - node.swapAt <= SPEED_TTL_MS ? node.swapBps : 0;
 }
 
-function recordSwapSpeed(state, host, bps, now) {
+function recordSwapSpeed(state, host, bps, now, weight) {
   const node = nodeOf(state, host);
   const known = swapSpeed(state, host, now);
-  node.swapBps = Math.round(known ? known * 0.7 + bps * 0.3 : bps);
+  node.swapBps = Math.max(Math.round(known ? known * (1 - weight) + bps * weight : bps), 1);
   node.swapAt = now;
 }
 
-// The best nodes in fanout order, without those known to send headers much later than the
-// quickest one. Nodes whose last contact failed only serve when no other is left.
-function pickSwapNode(config, state, now, url, exclude) {
+// How long the node is expected to take over a swap of this many bytes, in ms; null when it
+// has no speed on record.
+function swapTime(state, host, length, now) {
+  const node = state.nodes[host];
+  if (!node || !node.swapBps || now - node.swapAt > SWAP_FORGET_MS) return null;
+  return Math.round((node.lag || 0) + length * 1000 / node.swapBps);
+}
+
+// The nodes a swap may go to, in fanout order. Nodes whose last contact failed only serve
+// when no other is left.
+function swapNodes(config, state, now, exclude) {
   const ranked = rankedNodes(config, state, now, exclude);
-  const usable = ranked.filter((host) => isSuspect(state, host) === isSuspect(state, ranked[0]));
+  return ranked.filter((host) => isSuspect(state, host) === isSuspect(state, ranked[0]));
+}
+
+// The node due for a probe with this Range, if any; see PROBE_GAP_MS.
+function probeNode(config, state, now, exclude, length) {
+  if (!(length >= MIN_CHUNK_BYTES && length <= config.chunkBytes)) return null;
+  if (now - (state.probeAt || 0) < PROBE_GAP_MS) return null;
+  const usable = swapNodes(config, state, now, exclude).filter((host) => !isSuspect(state, host));
+  const last = (host) => swapTime(state, host, length, now) || 0;
+  // With no speed on record anywhere, the swaps spread over the nodes and measure them.
+  if (!usable.some(last)) return null;
+  const measured = usable.filter((host) => swapSpeed(state, host, now));
+  const due = usable.filter((host) => measured.indexOf(host) < 0
+    && now - ((state.nodes[host] && state.nodes[host].probedAt) || 0) > SPEED_TTL_MS
+    && !(lagOf(state, host, now) > SWAP_GOOD_MS)
+    && (!last(host) || measured.length < PROBE_KEEP));
+  return due.sort((a, b) => last(a) - last(b))[0] || null;
+}
+
+// The node for a swap of this many bytes: one of those expected to bring it in soonest.
+function pickSwapNode(config, state, now, url, exclude, length) {
+  const usable = swapNodes(config, state, now, exclude);
+  const times = usable.map((host) => swapTime(state, host, length, now));
+  const known = times.filter((ms) => ms !== null);
+  if (known.length) {
+    const limit = Math.min.apply(null, known) * SWAP_NEAR_RATIO + SWAP_NEAR_MS;
+    const near = usable.filter((_host, index) => times[index] !== null && times[index] <= limit);
+    return near[hashOf(url.path) % near.length];
+  }
   const lags = usable.map((host) => lagOf(state, host, now)).filter((lag) => lag !== null);
   const limit = Math.min.apply(null, lags) + SWAP_LAG_SLACK_MS;
   const pool = usable.filter((host) => !(lagOf(state, host, now) > limit));
@@ -494,21 +574,30 @@ function isOwnRequest(item) {
   return item.sourceAddress === "127.0.0.1" && (!item.processPath || /\/Surge$/.test(item.processPath));
 }
 
-// Reads the speed of finished swaps from Surge's list of recent requests, each one once.
-// A fanned-out request shows no bytes from the remote side, so it never counts here.
+// Reads how the players' finished downloads went from Surge's list of recent requests, each
+// one once, logging every one and measuring the nodes by it. A fanned-out request shows no
+// bytes from the remote side and the script's own chunk requests are skipped, so neither
+// counts here.
 function noteSwapSpeeds(state, requests, now) {
   const since = state.scannedTo || 0;
   const finished = (Array.isArray(requests) ? requests : [])
-    .filter((item) => item && item.completed && !item.failed && Number(item.completedDate) > since)
+    .filter((item) => item && item.completed && Number(item.completedDate) > since)
     .sort((a, b) => a.completedDate - b.completedDate);
   finished.forEach((item) => {
     state.scannedTo = Number(item.completedDate);
     const url = parseUrl(item.URL);
     const seconds = item.completedDate - item.startDate;
-    if (isOwnRequest(item) || !isMediaUrl(url) || !state.nodes[url.host]) return;
-    if (!(item.inBytes >= MIN_CHUNK_BYTES) || !(seconds > 0)) return;
-    const body = Math.max(seconds - (lagOf(state, url.host, now) || 0) / 1000, SWAP_BODY_MIN_S);
-    recordSwapSpeed(state, url.host, item.inBytes / body, now);
+    const bytes = Number(item.inBytes) || 0;
+    if (isOwnRequest(item) || !isMediaUrl(url) || !(seconds > 0) || (!bytes && !item.failed)) return;
+    const known = !!state.nodes[url.host];
+    const body = Math.max(seconds - (known ? lagOf(state, url.host, now) || 0 : 0) / 1000, SWAP_BODY_MIN_S);
+    const measures = bytes >= MIN_CHUNK_BYTES || (!!item.failed && body >= SWAP_STALL_S);
+    console.log("[bili-ripper] " + (item.failed ? "dropped" : "done") + ": " + Math.round(bytes / 1024) + "KB from "
+      + shortHost(url.host) + " in " + Math.round(seconds * 1000) + "ms"
+      + (measures ? " (" + Math.round(bytes / 1024 / body) + "KB/s)" : ""));
+    if (known && measures) {
+      recordSwapSpeed(state, url.host, bytes / body, now, bytes < MIN_CHUNK_BYTES ? SWAP_STALL_WEIGHT : SWAP_SPEED_WEIGHT);
+    }
   });
 }
 
@@ -743,11 +832,13 @@ function fetchChunkRaced(job, chunk) {
         result.host = host;
         if (result.ok) {
           recordNode(job.state, host, true, result.bps, now);
+          noteServed(job.state, job.path);
         } else if (result.status === 416 || (settled && !result.status)) {
           // A Range past the end of the file is the request's fault, not the node's. A copy
           // that lost the race and then got no reply was merely slow, and was marked down for it.
         } else if (isRefusal(result.status)) {
-          // The file is blamed once two nodes have refused it; before that, the node is.
+          // The file is blamed once two nodes that serve other files have refused it; before
+          // that, the node is.
           if (!noteRefusal(job.state, job.path, host, now)) {
             recordNode(job.state, host, false, 0, now, "HTTP " + result.status, BAN_MS);
           }
@@ -895,30 +986,33 @@ async function fanout(request, url, config, state, range, impatient) {
   return { status: 206, headers, body };
 }
 
+// Whether to fan the Range out instead of swapping it to host. A swap expected within
+// SWAP_GOOD_MS is always taken; a slower or unmeasured one gives way to a fanout unless the
+// recent fanouts were slower still, or too slow for this client to wait for.
 function fanoutEligible(request, config, state, range, now, impatient, host) {
   if (config.mode !== "fanout" || String(request.method || "GET").toUpperCase() !== "GET") return false;
   if (!range || state.cooldown > now) return false;
   if (range.end === null) return config.openRange === "clip";
   const length = range.end - range.start + 1;
   if (length <= config.chunkBytes) return false;
+  const size = "[bili-ripper] swapped " + Math.round(length / 1024) + "KB";
   if (length > config.maxBytes) {
-    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: over MaxMB " + config.maxBytes / 1048576);
-    return false;
-  }
-  if (length > budgetBytes(state, now, impatient)) {
-    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB" + (impatient ? "" : " (patient client)") + ": fanout at "
-      + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
+    console.log(size + ": over MaxMB " + config.maxBytes / 1048576);
     return false;
   }
   // The fanout speed is kept longer here than for the budget: while the swap node wins, no
   // fanout runs to renew it, and measuring it again costs a few slow replies.
   const fanoutBps = fanoutSpeed(state, now, SPEED_TTL_MS);
-  const swapBps = swapSpeed(state, host, now);
-  const fanoutMs = fanoutBps ? Math.round(length * 1000 / fanoutBps) : 0;
-  const swapMs = swapBps ? Math.round((lagOf(state, host, now) || 0) + length * 1000 / swapBps) : 0;
-  if (fanoutMs && swapMs && swapMs < fanoutMs) {
-    console.log("[bili-ripper] swapped " + Math.round(length / 1024) + "KB: " + shortHost(host) + " would take "
-      + swapMs + "ms, fanout " + fanoutMs + "ms");
+  const fanoutMs = fanoutBps ? Math.round(length * 1000 / fanoutBps) : null;
+  const swapMs = swapTime(state, host, length, now);
+  if (swapMs !== null && (swapMs <= SWAP_GOOD_MS || (fanoutMs !== null && swapMs <= fanoutMs))) {
+    console.log(size + ": " + shortHost(host) + " would take " + swapMs + "ms"
+      + (fanoutMs === null ? "" : ", fanout " + fanoutMs + "ms"));
+    return false;
+  }
+  if (length > budgetBytes(state, now, impatient)) {
+    console.log(size + (impatient ? "" : " (patient client)") + ": fanout at "
+      + Math.round(state.fanoutBps / 1024) + "KB/s would take " + Math.round(length * 1000 / state.fanoutBps) + "ms");
     return false;
   }
   return true;
@@ -954,10 +1048,8 @@ function onRequest() {
   const exclude = refused ? refused.hosts.slice() : [];
   const stale = state.assigns.filter((entry) => entry.key === key)[0];
   if (stale) {
-    const reason = stale.answered ? "the same Range was asked for again after its reply" : "no response to the last request";
     console.log("[bili-ripper] same Range asked for again " + (now - stale.at) + "ms after its swap to " + shortHost(stale.host)
       + (stale.answered ? " (headers came after " + (stale.answered - stale.at) + "ms)" : " (no headers yet)"));
-    recordNode(state, stale.host, false, 0, now, reason, BLIP_BAN_MS);
     // Headers that had not come by now took at least this long.
     if (!stale.answered && now - stale.at > (lagOf(state, stale.host, now) || 0)) recordLag(state, stale.host, now - stale.at, now);
     if (exclude.indexOf(stale.host) < 0) exclude.push(stale.host);
@@ -965,15 +1057,23 @@ function onRequest() {
   }
 
   const agent = agentOf($request.headers);
-  const host = pickSwapNode(config, state, now, url, exclude);
+  const range = parseRange(rangeHeader);
+  // An open Range has no size to go by: it is ranked as one chunk.
+  const length = range && range.end !== null ? range.end - range.start + 1 : config.chunkBytes;
+  const probe = stale ? null : probeNode(config, state, now, exclude, length);
+  const host = probe || pickSwapNode(config, state, now, url, exclude, length);
   const swap = () => {
+    if (host === probe) {
+      state.probeAt = now;
+      nodeOf(state, host).probedAt = now;
+      console.log("[bili-ripper] probing " + shortHost(host) + " with " + describeRange(range));
+    }
     state.assigns.push({ key, host, at: Date.now(), agent });
     if (state.assigns.length > MAX_ASSIGNS) state.assigns = state.assigns.slice(-MAX_ASSIGNS);
     saveState(state);
     $done({ url: "https://" + host + url.path + url.query, headers: swappedHeaders($request.headers, host) });
   };
 
-  const range = parseRange(rangeHeader);
   const impatient = noteClient(agent, key, now);
   if (!fanoutEligible($request, config, state, range, now, impatient, host)) {
     swap();
@@ -1016,11 +1116,14 @@ function onResponse() {
       + " for client " + (entry.agent || "?") + ": HTTP " + status + " after " + ms + "ms" + (ms > SLOW_SWAP_LOG_MS ? " (slow)" : ""));
     const ok = status >= 200 && status < 400;
     if (ok) {
-      // Counted as a success once RETRY_WINDOW_MS passes without the same Range coming back.
+      // Kept for RETRY_WINDOW_MS, so the same Range coming back goes to another node.
       entry.answered = now;
       recordLag(state, entry.host, ms, now);
+      recordNode(state, entry.host, true, 0, now);
+      noteServed(state, url.path);
     } else {
-      // A refusal counts against the file once two nodes have refused it, else against the node.
+      // A refusal counts against the file once two nodes that serve other files have refused
+      // it, else against the node.
       if (!isRefusal(status) || !noteRefusal(state, url.path, entry.host, now)) {
         recordNode(state, entry.host, false, 0, now, "HTTP " + status, BAN_MS);
       }

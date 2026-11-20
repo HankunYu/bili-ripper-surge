@@ -27,8 +27,9 @@ function createContext(globals) {
 }
 
 // Loads the script without a request, so its functions can be called directly.
-function loadFunctions() {
-  return createContext({ $persistentStore: createStore() });
+// Lines the script logs go to console.log when one is given.
+function loadFunctions(console) {
+  return createContext(Object.assign({ $persistentStore: createStore() }, console ? { console } : {}));
 }
 
 // Runs one hook and resolves with what the script passed to $done.

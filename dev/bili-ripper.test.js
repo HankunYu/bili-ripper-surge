@@ -412,20 +412,21 @@ test("response hook bans a node after repeated failures", async () => {
 test("bans double while a node keeps failing and reset after a success", () => {
   const host = MAINLAND[0];
   const seen = [];
-  for (let round = 0; round < 7; round++) {
+  for (let round = 0; round < 13; round++) {
     const now = round * 1e6;
     const st = { nodes: seen.length ? { [host]: seen[seen.length - 1].node } : {} };
     fn.recordNode(st, host, false, 0, now, "no reply", 60000);
     fn.recordNode(st, host, false, 0, now, "no reply", 60000);
     seen.push({ ms: st.nodes[host].until - now, node: plain(st.nodes[host]) });
   }
-  assert.deepEqual(seen.map((s) => s.ms / 60000), [1, 2, 4, 8, 16, 30, 30]);
+  // Up to a day, so a node that refuses for good is tried about once a day.
+  assert.deepEqual(seen.map((s) => s.ms / 60000), [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 1440, 1440]);
   const st = { nodes: { [host]: seen[seen.length - 1].node } };
-  fn.recordNode(st, host, true, 0, 7e6);
+  fn.recordNode(st, host, true, 0, 13e6);
   assert.equal(st.nodes[host].suspect, false);
-  fn.recordNode(st, host, false, 0, 8e6, "no reply", 60000);
-  fn.recordNode(st, host, false, 0, 8e6, "no reply", 60000);
-  assert.equal(st.nodes[host].until - 8e6, 60000);
+  fn.recordNode(st, host, false, 0, 14e6, "no reply", 60000);
+  fn.recordNode(st, host, false, 0, 14e6, "no reply", 60000);
+  assert.equal(st.nodes[host].until - 14e6, 60000);
 });
 
 test("a name that does not resolve bans the node as long as a server error", async () => {
@@ -450,8 +451,17 @@ test("a node whose last contact failed ranks behind the others until it answers 
   assert.deepEqual(plain(fn.rankedNodes(config, st, 4, [])), [c, a, b]);
 });
 
-test("a swapped request refused by a node moves the file elsewhere, then to its original host", async () => {
+// A state in which every mainland node answered a moment ago.
+function provenNodes(store) {
+  const now = Date.now();
+  const nodes = {};
+  MAINLAND.forEach((host) => { nodes[host] = { bps: 0, at: 0, fail: 0, until: 0, okAt: now }; });
+  store.write(JSON.stringify({ v: 1, nodes, cooldown: 0, assigns: [] }), "bili-ripper.state");
+}
+
+test("a swapped request refused by two nodes that serve other files goes to its original host", async () => {
   const store = createStore();
+  provenNodes(store);
   const first = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
   const a = hostOf(first.url);
   await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 403, headers: {} }, store });
@@ -464,15 +474,51 @@ test("a swapped request refused by a node moves the file elsewhere, then to its 
   // A file nobody serves is not held against the nodes.
   const nodes = state(store).nodes;
   assert.equal(nodes[a].until, 0);
-  assert.ok(!nodes[b] || nodes[b].until === 0);
+  assert.equal(nodes[b].until, 0);
+  assert.ok(!nodes[b].suspect);
 });
 
-test("a repeated request without a response moves to another node", async () => {
+test("refusals from nodes that have served nothing count against the nodes, not the file", async () => {
+  const store = createStore();
+  const refusers = [];
+  for (let i = 0; i < 3; i++) {
+    const swapped = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
+    refusers.push(hostOf(swapped.url));
+    await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 400, headers: {} }, store });
+  }
+  assert.equal(new Set(refusers).size, 3);
+  // Three nodes refused, and the file is still sent to a fourth, which serves it.
+  const fourth = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
+  assert.ok(fourth.url && refusers.indexOf(hostOf(fourth.url)) < 0);
+  await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 206, headers: {} }, store });
+  const nodes = state(store).nodes;
+  refusers.forEach((host) => assert.equal(nodes[host].suspect, true));
+  // Being served clears the count, so two more refusals do not add up to four.
+  for (let i = 0; i < 2; i++) {
+    const swapped = await runHook({ request: mediaRequest("bytes=" + (2 + i) + "-9", { url: AKAM_URL.replace("_da2", "_x" + i) }), argument: "mode=swap", store });
+    assert.ok(swapped.url);
+    await runHook({ request: mediaRequest("bytes=" + (2 + i) + "-9", { url: AKAM_URL.replace("_da2", "_x" + i) }), response: { status: 400, headers: {} }, store });
+  }
+  assert.ok((await runHook({ request: mediaRequest("bytes=20-29"), argument: "mode=swap", store })).url);
+});
+
+test("four refusals in a row send a file to its original host even from nodes that have served nothing", async () => {
+  const store = createStore();
+  for (let i = 0; i < 4; i++) {
+    const swapped = await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store });
+    assert.ok(swapped.url);
+    await runHook({ request: mediaRequest("bytes=0-1"), response: { status: 403, headers: {} }, store });
+  }
+  assert.deepEqual(plain(await runHook({ request: mediaRequest("bytes=0-1"), argument: "mode=swap", store })), {});
+});
+
+test("a repeated request without a response moves to another node, which is not blamed", async () => {
   const store = createStore();
   const first = await runHook({ request: mediaRequest("bytes=0-99"), argument: "mode=swap", store });
   const retry = await runHook({ request: mediaRequest("bytes=0-99"), argument: "mode=swap", store });
   assert.notEqual(hostOf(retry.url), hostOf(first.url));
-  assert.equal(state(store).nodes[hostOf(first.url)].fail, 1);
+  const node = state(store).nodes[hostOf(first.url)];
+  assert.ok(!node || (!node.fail && !node.suspect));
 });
 
 test("swap drops If-Range, since every node has its own ETag for the same bytes", async () => {
@@ -484,34 +530,33 @@ test("swap drops If-Range, since every node has its own ETag for the same bytes"
   assert.equal(result.headers.Range, "bytes=0-5929");
 });
 
-test("the same Range asked for again soon after a good reply moves to another node", async () => {
+test("the same Range asked for again soon after a good reply moves to another node, which is not blamed", async () => {
   const store = createStore();
   const first = await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
   const a = hostOf(first.url);
-  // Headers arrive, the body never does: the reply looks fine and counts for nothing yet.
   await runHook({ request: mediaRequest("bytes=0-5929"), response: { status: 206, headers: {} }, store });
-  assert.ok(!state(store).nodes[a] || !state(store).nodes[a].fail);
   const retry = await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
   assert.notEqual(hostOf(retry.url), a);
-  assert.equal(state(store).nodes[a].fail, 1);
-  assert.equal(state(store).nodes[a].suspect, true);
-  // The node that failed is put behind the others for new Ranges too.
-  const next = await runHook({ request: mediaRequest("bytes=5930-9999"), argument: "mode=swap", store });
-  assert.notEqual(hostOf(next.url), a);
+  // Players read a Range twice of their own accord; the node's speed is what tells on it.
+  assert.equal(state(store).nodes[a].fail, 0);
+  assert.equal(state(store).nodes[a].suspect, false);
+  assert.equal(state(store).nodes[a].until, 0);
 });
 
-test("a good reply counts once the retry window passes without the same Range coming back", async () => {
+test("a good reply clears a node's failures at once", async () => {
   const store = createStore();
   const host = MAINLAND[0];
   const now = Date.now();
   store.write(JSON.stringify({
-    v: 1, cooldown: 0, nodes: { [host]: { bps: 1e6, at: now, fail: 1, until: 0, suspect: true } },
-    assigns: [{ key: PATH + "|bytes=0-5929", host, at: now - 15000, answered: now - 11000 }]
+    v: 1, cooldown: 0, nodes: { [host]: { bps: 1e6, at: now, fail: 1, until: 0, suspect: true } }, assigns: []
   }), "bili-ripper.state");
-  await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap", store });
+  const swapped = await runHook({ request: mediaRequest("bytes=0-5929"), argument: "mode=swap&nodes=" + host, store });
+  assert.equal(hostOf(swapped.url), host);
+  await runHook({ request: mediaRequest("bytes=0-5929"), response: { status: 206, headers: {} }, store });
   const node = state(store).nodes[host];
   assert.equal(node.fail, 0);
   assert.equal(node.suspect, false);
+  assert.ok(node.okAt >= now);
 });
 
 test("a patient client fans out Ranges too slow for 1.5 s, but not ones too slow for 15 s", async () => {
@@ -830,4 +875,94 @@ test("a Range the swap node brings in faster than the recent fanouts is swapped,
   // Faster than the fanout by speed alone, but not once the wait for headers is added.
   const slow = await run(660 * KB);
   assert.equal(slow.result.response.status, 206);
+});
+
+test("a swap goes to the node expected to bring the Range in soonest: wait for headers plus size over speed", () => {
+  const [a, b, c, d] = MAINLAND;
+  const config = fn.parseConfig("nodes=" + [a, b, c, d].join("|"));
+  const now = 5e9;
+  const node = (lag, swapBps) => Object.assign({ bps: 1e6, at: now, fail: 0, until: 0, lag, lagAt: now }, swapBps ? { swapBps, swapAt: now } : {});
+  // a answers first but sends slowly; b and c are close to each other; d was never measured.
+  const st = { nodes: { [a]: node(50, 150 * KB), [b]: node(200, 5 * MB), [c]: node(250, 6 * MB), [d]: node(100) } };
+  assert.equal(fn.swapTime(st, a, 3 * MB, now), 50 + 20480);
+  assert.equal(fn.swapTime(st, d, 3 * MB, now), null);
+  const pick = (length) => {
+    const picked = new Set();
+    for (let i = 0; i < 40; i++) picked.add(fn.pickSwapNode(config, st, now, { path: PATH + i }, [], length));
+    return [...picked].sort();
+  };
+  assert.deepEqual(pick(3 * MB), [b, c].sort());
+  // For a few bytes the wait for headers is nearly all there is: a wins, b and c are too far behind.
+  assert.deepEqual(pick(2 * KB), [a]);
+  // One file stays on one node.
+  assert.equal(fn.pickSwapNode(config, st, now, { path: PATH }, [], 3 * MB), fn.pickSwapNode(config, st, now, { path: PATH }, [], 2 * MB));
+  // A node left out for this request is not picked.
+  assert.equal(fn.pickSwapNode(config, st, now, { path: PATH }, [b], 3 * MB), c);
+});
+
+test("now and then a mid-sized Range goes to a node without a recent measurement", async () => {
+  const store = createStore();
+  const now = Date.now();
+  const [a, b, c, d] = MAINLAND;
+  const args = "nodes=" + [a, b, c, d].join("|");
+  const node = (extra) => Object.assign({ bps: 1e6, at: now, fail: 0, until: 0, lag: 200, lagAt: now }, extra);
+  store.write(JSON.stringify({ v: 1, cooldown: 0, assigns: [], nodes: {
+    [a]: node({ swapBps: 5 * MB, swapAt: now }),
+    // b was never measured, c failed last time, d was measured two hours ago.
+    [b]: node({}), [c]: node({ suspect: true, fail: 1 }), [d]: node({ swapBps: 200 * KB, swapAt: now - 2 * 60 * 60 * 1000 })
+  } }), "bili-ripper.state");
+  const logs = [];
+  const swapTo = async (range) => hostOf((await runHook({ request: mediaRequest(range), argument: args, store, logs })).url);
+  // Too small to measure a speed: no probe.
+  assert.equal(await swapTo("bytes=0-99999"), a);
+  assert.equal(await swapTo("bytes=0-524287"), b);
+  assert.ok(logs.some((line) => /probing upos-sz-mirrorhw with 512KB/.test(line)), logs.join("\n"));
+  // Not again right away.
+  assert.equal(await swapTo("bytes=524288-1048575"), a);
+  const saved = state(store);
+  saved.probeAt -= 31000;
+  store.write(JSON.stringify(saved), "bili-ripper.state");
+  // b was probed within the hour and c failed last time: d is next, as fewer than three nodes are measured.
+  assert.equal(await swapTo("bytes=1048576-1572863"), d);
+  const later = state(store);
+  later.probeAt -= 31000;
+  store.write(JSON.stringify(later), "bili-ripper.state");
+  assert.equal(await swapTo("bytes=1572864-2097151"), a);
+});
+
+test("a swap expected within 1.5 s is taken without any fanout to compare with", async () => {
+  const store = createStore();
+  const now = Date.now();
+  const nodes = {};
+  MAINLAND.forEach((host) => { nodes[host] = { bps: 1e6, at: now, fail: 0, until: 0, swapBps: 5 * MB, swapAt: now, lag: 200, lagAt: now }; });
+  store.write(JSON.stringify({ v: 1, nodes, cooldown: 0, assigns: [] }), "bili-ripper.state");
+  const logs = [];
+  const quick = await runHook({ request: mediaRequest("bytes=0-3145727"), store, logs });
+  assert.ok(quick.url);
+  assert.ok(logs.some((line) => /swapped 3072KB: \S+ would take 800ms$/.test(line)), logs.join("\n"));
+  // 16 MB would take 3.4 s: with no fanout speed known, a fanout is tried.
+  const cdn = createCdn(32 * MB);
+  const big = await runHook({ request: mediaRequest("bytes=0-16777215"), store, http: cdn.get });
+  assert.equal(big.response.status, 206);
+});
+
+test("a download dropped after a second with little to show lowers the node's speed, and every outcome is logged", () => {
+  const host = MAINLAND[0];
+  const now = 5e9;
+  const st = { nodes: { [host]: { bps: 0, at: 0, fail: 0, until: 0, lag: 200, lagAt: now, swapBps: 4 * MB, swapAt: now } }, scannedTo: 0 };
+  const logs = [];
+  const context = require("./harness").loadFunctions({ log: (line) => logs.push(line) });
+  context.noteSwapSpeeds(st, [
+    listed(host, 20 * KB, 3.2, 1000, { failed: true }),
+    // Dropped at once, as on a seek: tells nothing.
+    listed(host, 0, 0.15, 1001, { failed: true }),
+    listed("upos-hz-mirrorakam.akamaized.net", 2 * MB, 4.2, 1002)
+  ], now);
+  // A stall weighs half: 4 MB/s and 7 KB/s make 2 MB/s.
+  assert.ok(st.nodes[host].swapBps < 2.1 * MB && st.nodes[host].swapBps > 1.9 * MB, String(st.nodes[host].swapBps));
+  assert.deepEqual(logs, [
+    "[bili-ripper] dropped: 20KB from upos-sz-mirrorali in 3200ms (7KB/s)",
+    "[bili-ripper] dropped: 0KB from upos-sz-mirrorali in 150ms",
+    "[bili-ripper] done: 2048KB from upos-hz-mirrorakam.akamaized.net in 4200ms (488KB/s)"
+  ]);
 });
